@@ -22,6 +22,39 @@ conda activate ryzen-ai-1.7.1
 source /opt/AMD/ryzenai/venv/bin/activate.fish
 ```
 
+## PostgreSQL and pgvector
+
+The local database runs PostgreSQL 18 (the current stable major release) with
+pgvector preinstalled. PostgreSQL 19 is still a beta release as of July 2026.
+
+Install Goose, start PostgreSQL, and apply the schema:
+
+```bash
+make tools
+make db-up
+make migrate-up
+```
+
+Open a `psql` shell inside the container:
+
+```bash
+make db-psql
+```
+
+The Go application uses GORM and reads `DATABASE_URL`. When it is unset, it
+defaults to the credentials in `compose.yaml`. Copy `.env.example` if you want
+to customize the Compose or application settings:
+
+```bash
+cp .env.example .env
+export DATABASE_URL='postgres://semantic_search:semantic_search@localhost:5432/semantic_search?sslmode=disable'
+```
+
+The first migration enables pgvector and creates a split schema: `documents`
+stores `source_uri` plus JSONB metadata, and `embeddings` stores the
+`vector(768)` rows linked back to documents. The vector size matches the current
+SigLIP embedding output.
+
 ## Test the FastAPI embedding service
 
 Start the service:

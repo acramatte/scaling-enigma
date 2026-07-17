@@ -12,8 +12,13 @@
 
 !*.go
 !*.py
+!*.sql
+!*.yaml
+!*.yml
 !go.sum
 !go.mod
+!.env.example
+!Makefile
 
 !README.md
 
