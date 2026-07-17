@@ -1,6 +1,7 @@
 DATABASE_URL ?= postgres://semantic_search:semantic_search@localhost:5432/semantic_search?sslmode=disable
+GOOSE_VERSION ?= v3.27.0
 
-.PHONY: db-up db-down db-psql db-reset-dev migrate-up migrate-down migrate-status tools
+.PHONY: db-up db-down db-psql db-reset-dev migrate-up migrate-down migrate-status test-integration tools
 
 db-up:
 	docker compose up -d --wait postgres
@@ -24,5 +25,8 @@ migrate-down:
 migrate-status:
 	goose -dir migrations postgres "$(DATABASE_URL)" status
 
+test-integration:
+	go test -count=1 -tags=integration ./internal/database
+
 tools:
-	go install github.com/pressly/goose/v3/cmd/goose@latest
+	go install github.com/pressly/goose/v3/cmd/goose@$(GOOSE_VERSION)

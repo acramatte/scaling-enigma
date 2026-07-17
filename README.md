@@ -189,6 +189,20 @@ The Go client asks the Python service for the normalized text embedding, then
 orders matching database rows with pgvector's cosine-distance operator. Results
 include the source URI and, for video frames, the segment timing.
 
+## Database integration test
+
+Run the search integration test in a disposable pgvector container:
+
+```bash
+make test-integration
+```
+
+Testcontainers starts the same PostgreSQL/pgvector image used by Compose on a
+random host port, and Goose applies the embedded project migrations. The test
+writes its fixtures inside a transaction that is rolled back, then removes the
+container. It verifies cosine ordering, model and media filters, limits, JSONB
+metadata, and video segment timing without touching the development database.
+
 ## Architecture: Why Python + Go?
 
 This project uses a hybrid dual-runtime architecture split between Go and Python. Go is the intended orchestration layer, while Python owns the ONNX/Ryzen AI execution path and can fall back to CPU execution when the VitisAI provider is not available.
