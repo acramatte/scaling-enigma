@@ -2,6 +2,7 @@ package embedder
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -73,6 +74,12 @@ func (c *Client) GetFrameEmbedding(imagePath string) (Result, error) {
 // GetTextEmbedding embeds a natural-language query in the same vector space as
 // the image embeddings returned by GetFrameEmbedding.
 func (c *Client) GetTextEmbedding(text string) (Result, error) {
+	return c.GetTextEmbeddingContext(context.Background(), text)
+}
+
+// GetTextEmbeddingContext embeds text while allowing callers to cancel the
+// request, for example when an incoming HTTP request is abandoned.
+func (c *Client) GetTextEmbeddingContext(ctx context.Context, text string) (Result, error) {
 	payload, err := json.Marshal(struct {
 		Text string `json:"text"`
 	}{Text: text})
@@ -80,7 +87,7 @@ func (c *Client) GetTextEmbedding(text string) (Result, error) {
 		return Result{}, fmt.Errorf("failed to encode text embedding request: %w", err)
 	}
 
-	req, err := http.NewRequest("POST", c.endpoint+"/embed/text", bytes.NewReader(payload))
+	req, err := http.NewRequestWithContext(ctx, "POST", c.endpoint+"/embed/text", bytes.NewReader(payload))
 	if err != nil {
 		return Result{}, fmt.Errorf("failed to construct request: %w", err)
 	}

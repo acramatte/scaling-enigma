@@ -2,22 +2,28 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"mime"
+	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	appdb "semantic-search/internal/database"
 	"semantic-search/internal/embedder"
+	"semantic-search/internal/webapp"
 
 	"gorm.io/gorm"
 )
 
 const defaultEmbedderURL = "http://127.0.0.1:8000"
+const defaultHTTPAddress = "127.0.0.1:8080"
 
 func previewLength(limit int, values []float64) int {
 	if len(values) < limit {
@@ -65,6 +71,12 @@ func main() {
 			os.Exit(2)
 		}
 		err = search(db, client, strings.Join(os.Args[2:], " "))
+	case "serve":
+		if len(os.Args) != 2 {
+			printUsage()
+			os.Exit(2)
+		}
+		err = serve(db, client)
 	default:
 		// Keep the original one-argument image indexing command working.
 		if len(os.Args) != 2 {
@@ -78,6 +90,36 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+func serve(db *gorm.DB, client *embedder.Client) error {
+	address := strings.TrimSpace(os.Getenv("HTTP_ADDR"))
+	if address == "" {
+		address = defaultHTTPAddress
+	}
+
+	server := &http.Server{
+		Addr:              address,
+		Handler:           webapp.New(db, client),
+		ReadHeaderTimeout: 5 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+
+	shutdownCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	go func() {
+		<-shutdownCtx.Done()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = server.Shutdown(ctx)
+	}()
+
+	fmt.Printf("Semantic search UI listening on http://%s\n", address)
+	err := server.ListenAndServe()
+	if errors.Is(err, http.ErrServerClosed) {
+		return nil
+	}
+	return fmt.Errorf("serve semantic search UI: %w", err)
 }
 
 func indexImage(db *gorm.DB, client *embedder.Client, path string) error {
@@ -169,4 +211,5 @@ func printUsage() {
 	fmt.Fprintln(os.Stderr, "usage:")
 	fmt.Fprintln(os.Stderr, "  go run client.go index /path/to/image")
 	fmt.Fprintln(os.Stderr, "  go run client.go search natural language query")
+	fmt.Fprintln(os.Stderr, "  go run client.go serve")
 }

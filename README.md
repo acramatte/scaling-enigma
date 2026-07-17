@@ -189,6 +189,21 @@ The Go client asks the Python service for the normalized text embedding, then
 orders matching database rows with pgvector's cosine-distance operator. Results
 include the source URI and, for video frames, the segment timing.
 
+## Web search
+
+With PostgreSQL and the FastAPI embedding service running, start the Go web
+server:
+
+```bash
+go run client.go serve
+```
+
+Open [http://127.0.0.1:8080](http://127.0.0.1:8080), enter a natural-language
+description, and the page will display the closest indexed documents. The
+server uses only Go's standard `net/http` and `html/template` packages for the
+web layer; it reuses the same text-embedding and pgvector search path as the
+CLI. Set `HTTP_ADDR` to change the listening address.
+
 ## Database integration test
 
 Run the search integration test in a disposable pgvector container:
