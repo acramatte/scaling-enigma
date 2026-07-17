@@ -7,11 +7,17 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 
 	appdb "semantic-search/internal/database"
 	"semantic-search/internal/embedder"
+
+	"gorm.io/gorm"
 )
+
+const defaultEmbedderURL = "http://127.0.0.1:8000"
 
 func previewLength(limit int, values []float64) int {
 	if len(values) < limit {
@@ -21,17 +27,10 @@ func previewLength(limit int, values []float64) int {
 }
 
 func main() {
-	if len(os.Args) != 2 {
-		fmt.Fprintf(os.Stderr, "usage: go run client.go /path/to/image\n")
+	if len(os.Args) < 2 {
+		printUsage()
 		os.Exit(2)
 	}
-
-	imagePath, err := filepath.Abs(os.Args[1])
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Invalid image path: %v\n", err)
-		os.Exit(1)
-	}
-	sourceURI := (&url.URL{Scheme: "file", Path: imagePath}).String()
 
 	connectCtx, cancelConnect := context.WithTimeout(context.Background(), 5*time.Second)
 	db, err := appdb.Open(connectCtx)
@@ -47,19 +46,53 @@ func main() {
 	}
 	defer sqlDB.Close()
 
-	client := embedder.NewClient("http://127.0.0.1:8000")
+	embedderURL := os.Getenv("EMBEDDER_URL")
+	if embedderURL == "" {
+		embedderURL = defaultEmbedderURL
+	}
+	client := embedder.NewClient(embedderURL)
 
-	fmt.Printf("Generating embedding for %s...\n", imagePath)
-	startTime := time.Now()
+	switch os.Args[1] {
+	case "index":
+		if len(os.Args) != 3 {
+			printUsage()
+			os.Exit(2)
+		}
+		err = indexImage(db, client, os.Args[2])
+	case "search":
+		if len(os.Args) < 3 {
+			printUsage()
+			os.Exit(2)
+		}
+		err = search(db, client, strings.Join(os.Args[2:], " "))
+	default:
+		// Keep the original one-argument image indexing command working.
+		if len(os.Args) != 2 {
+			printUsage()
+			os.Exit(2)
+		}
+		err = indexImage(db, client, os.Args[1])
+	}
 
-	vector, err := client.GetFrameEmbedding(imagePath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
+}
 
-	duration := time.Since(startTime)
-	preview := previewLength(5, vector)
+func indexImage(db *gorm.DB, client *embedder.Client, path string) error {
+	imagePath, err := filepath.Abs(path)
+	if err != nil {
+		return fmt.Errorf("resolve image path: %w", err)
+	}
+	sourceURI := (&url.URL{Scheme: "file", Path: imagePath}).String()
+
+	fmt.Printf("Generating embedding for %s...\n", imagePath)
+	startTime := time.Now()
+	embedding, err := client.GetFrameEmbedding(imagePath)
+	if err != nil {
+		return err
+	}
 
 	saveCtx, cancelSave := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancelSave()
@@ -67,21 +100,73 @@ func main() {
 		SourceURI:   sourceURI,
 		MediaType:   appdb.MediaTypeImage,
 		ContentType: mime.TypeByExtension(filepath.Ext(imagePath)),
-		Model:       appdb.DefaultEmbeddingModel,
+		Model:       embedding.Model,
 		DocumentMetadata: appdb.Metadata{
 			"local_path": imagePath,
 		},
 		EmbeddingMetadata: appdb.Metadata{
-			"dimensions": len(vector),
+			"dimensions": len(embedding.Values),
 		},
-		Values: vector,
+		Values: embedding.Values,
 	}); err != nil {
-		fmt.Fprintf(os.Stderr, "Database save failed: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("save embedding: %w", err)
 	}
 
-	fmt.Printf("Successfully generated vector in %v!\n", duration)
-	fmt.Printf("Vector Dimensions: %d\n", len(vector))
-	fmt.Printf("First %d Dimensions: %v\n", preview, vector[:preview])
+	preview := previewLength(5, embedding.Values)
+	fmt.Printf("Generated vector in %v\n", time.Since(startTime))
+	fmt.Printf("Vector dimensions: %d\n", len(embedding.Values))
+	fmt.Printf("First %d dimensions: %v\n", preview, embedding.Values[:preview])
 	fmt.Printf("Stored embedding for %s\n", sourceURI)
+	return nil
+}
+
+func search(db *gorm.DB, client *embedder.Client, query string) error {
+	fmt.Printf("Searching for %q...\n", query)
+	embedding, err := client.GetTextEmbedding(query)
+	if err != nil {
+		return fmt.Errorf("embed text query: %w", err)
+	}
+
+	searchCtx, cancelSearch := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelSearch()
+	results, err := appdb.SearchDocuments(searchCtx, db, appdb.SearchInput{
+		Values: embedding.Values,
+		Model:  embedding.Model,
+		Limit:  10,
+	})
+	if err != nil {
+		return err
+	}
+
+	if len(results) == 0 {
+		fmt.Println("No indexed documents found.")
+		return nil
+	}
+
+	for index, result := range results {
+		segment := ""
+		if result.StartMS != nil || result.EndMS != nil {
+			segment = fmt.Sprintf(
+				" segment=%d start_ms=%s end_ms=%s",
+				result.SegmentIndex,
+				optionalMilliseconds(result.StartMS),
+				optionalMilliseconds(result.EndMS),
+			)
+		}
+		fmt.Printf("%d. similarity=%.4f%s %s\n", index+1, result.Similarity, segment, result.SourceURI)
+	}
+	return nil
+}
+
+func optionalMilliseconds(value *int64) string {
+	if value == nil {
+		return "-"
+	}
+	return strconv.FormatInt(*value, 10)
+}
+
+func printUsage() {
+	fmt.Fprintln(os.Stderr, "usage:")
+	fmt.Fprintln(os.Stderr, "  go run client.go index /path/to/image")
+	fmt.Fprintln(os.Stderr, "  go run client.go search natural language query")
 }

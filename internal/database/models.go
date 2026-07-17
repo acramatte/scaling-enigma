@@ -9,10 +9,10 @@ import (
 	"github.com/pgvector/pgvector-go"
 )
 
-// EmbeddingDimensions must match the output size of the SigLIP 2 vision ONNX model.
+// EmbeddingDimensions must match both towers of the SigLIP 2 ONNX model.
 // If the model changes, update this constant and the vector size in migrations.
 const EmbeddingDimensions = 768
-const DefaultEmbeddingModel = "siglip2-vision"
+const DefaultEmbeddingModel = "google/siglip2-base-patch16-256"
 const MediaTypeImage = "image"
 const MediaTypeVideo = "video"
 const MediaTypeUnknown = "unknown"

@@ -9,11 +9,18 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
 type embeddingResponse struct {
 	Embedding []float64 `json:"embedding"`
+	Model     string    `json:"model"`
+}
+
+type Result struct {
+	Values []float64
+	Model  string
 }
 
 // Client wraps the FastAPI embedding service connection.
@@ -24,7 +31,7 @@ type Client struct {
 
 func NewClient(endpoint string) *Client {
 	return &Client{
-		endpoint: endpoint,
+		endpoint: strings.TrimRight(endpoint, "/"),
 		client: &http.Client{
 			Timeout: 10 * time.Second,
 		},
@@ -32,10 +39,10 @@ func NewClient(endpoint string) *Client {
 }
 
 // GetFrameEmbedding sends raw image data directly to the embedding service.
-func (c *Client) GetFrameEmbedding(imagePath string) ([]float64, error) {
+func (c *Client) GetFrameEmbedding(imagePath string) (Result, error) {
 	file, err := os.Open(imagePath)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open file: %w", err)
+		return Result{}, fmt.Errorf("failed to open file: %w", err)
 	}
 	defer file.Close()
 
@@ -43,38 +50,61 @@ func (c *Client) GetFrameEmbedding(imagePath string) ([]float64, error) {
 	writer := multipart.NewWriter(body)
 	part, err := writer.CreateFormFile("file", filepath.Base(imagePath))
 	if err != nil {
-		return nil, fmt.Errorf("failed to create form file: %w", err)
+		return Result{}, fmt.Errorf("failed to create form file: %w", err)
 	}
 
 	_, err = io.Copy(part, file)
 	if err != nil {
-		return nil, fmt.Errorf("failed to copy file payload: %w", err)
+		return Result{}, fmt.Errorf("failed to copy file payload: %w", err)
 	}
 	if err := writer.Close(); err != nil {
-		return nil, fmt.Errorf("failed to close multipart writer: %w", err)
+		return Result{}, fmt.Errorf("failed to close multipart writer: %w", err)
 	}
 
-	req, err := http.NewRequest("POST", c.endpoint+"/embed", body)
+	req, err := http.NewRequest("POST", c.endpoint+"/embed/image", body)
 	if err != nil {
-		return nil, fmt.Errorf("failed to construct request: %w", err)
+		return Result{}, fmt.Errorf("failed to construct request: %w", err)
 	}
 	req.Header.Set("Content-Type", writer.FormDataContentType())
 
+	return c.do(req)
+}
+
+// GetTextEmbedding embeds a natural-language query in the same vector space as
+// the image embeddings returned by GetFrameEmbedding.
+func (c *Client) GetTextEmbedding(text string) (Result, error) {
+	payload, err := json.Marshal(struct {
+		Text string `json:"text"`
+	}{Text: text})
+	if err != nil {
+		return Result{}, fmt.Errorf("failed to encode text embedding request: %w", err)
+	}
+
+	req, err := http.NewRequest("POST", c.endpoint+"/embed/text", bytes.NewReader(payload))
+	if err != nil {
+		return Result{}, fmt.Errorf("failed to construct request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	return c.do(req)
+}
+
+func (c *Client) do(req *http.Request) (Result, error) {
 	resp, err := c.client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("network call to embedding service failed: %w", err)
+		return Result{}, fmt.Errorf("network call to embedding service failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("embedding service returned error (%d): %s", resp.StatusCode, string(respBody))
+		return Result{}, fmt.Errorf("embedding service returned error (%d): %s", resp.StatusCode, string(respBody))
 	}
 
 	var response embeddingResponse
 	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
-		return nil, fmt.Errorf("failed parsing embedding array: %w", err)
+		return Result{}, fmt.Errorf("failed parsing embedding array: %w", err)
 	}
 
-	return response.Embedding, nil
+	return Result{Values: response.Embedding, Model: response.Model}, nil
 }
