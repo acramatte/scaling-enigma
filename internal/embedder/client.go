@@ -47,14 +47,20 @@ func (c *Client) GetFrameEmbedding(imagePath string) (Result, error) {
 	}
 	defer file.Close()
 
+	return c.GetImageEmbeddingContext(context.Background(), filepath.Base(imagePath), "", file)
+}
+
+// GetImageEmbeddingContext sends image data to the embedding service while
+// allowing callers to cancel the HTTP request.
+func (c *Client) GetImageEmbeddingContext(ctx context.Context, filename, contentType string, image io.Reader) (Result, error) {
 	body := &bytes.Buffer{}
 	writer := multipart.NewWriter(body)
-	part, err := writer.CreateFormFile("file", filepath.Base(imagePath))
+	part, err := writer.CreateFormFile("file", filename)
 	if err != nil {
 		return Result{}, fmt.Errorf("failed to create form file: %w", err)
 	}
 
-	_, err = io.Copy(part, file)
+	_, err = io.Copy(part, image)
 	if err != nil {
 		return Result{}, fmt.Errorf("failed to copy file payload: %w", err)
 	}
@@ -62,7 +68,7 @@ func (c *Client) GetFrameEmbedding(imagePath string) (Result, error) {
 		return Result{}, fmt.Errorf("failed to close multipart writer: %w", err)
 	}
 
-	req, err := http.NewRequest("POST", c.endpoint+"/embed/image", body)
+	req, err := http.NewRequestWithContext(ctx, "POST", c.endpoint+"/embed/image", body)
 	if err != nil {
 		return Result{}, fmt.Errorf("failed to construct request: %w", err)
 	}

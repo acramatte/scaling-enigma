@@ -17,6 +17,14 @@ const MediaTypeImage = "image"
 const MediaTypeVideo = "video"
 const MediaTypeUnknown = "unknown"
 
+const (
+	IngestionJobPending    = "pending"
+	IngestionJobProcessing = "processing"
+	IngestionJobCompleted  = "completed"
+	IngestionJobIgnored    = "ignored"
+	IngestionJobFailed     = "failed"
+)
+
 type Metadata map[string]any
 
 func (m Metadata) Value() (driver.Value, error) {
@@ -91,4 +99,28 @@ type Embedding struct {
 
 func (Embedding) TableName() string {
 	return "embeddings"
+}
+
+// IngestionJob records a single object version that must be fetched and
+// indexed. The object identity makes at-least-once bucket notifications safe.
+type IngestionJob struct {
+	ID            int64      `gorm:"primaryKey"`
+	Bucket        string     `gorm:"not null"`
+	ObjectKey     string     `gorm:"column:object_key;not null"`
+	ObjectVersion string     `gorm:"column:object_version;not null"`
+	ETag          string     `gorm:"column:etag;not null"`
+	SizeBytes     *int64     `gorm:"column:size_bytes"`
+	ContentType   string     `gorm:"not null"`
+	Status        string     `gorm:"not null"`
+	Attempts      int        `gorm:"not null"`
+	LastError     string     `gorm:"not null"`
+	AvailableAt   time.Time  `gorm:"column:available_at;not null"`
+	StartedAt     *time.Time `gorm:"column:started_at"`
+	CompletedAt   *time.Time `gorm:"column:completed_at"`
+	CreatedAt     time.Time
+	UpdatedAt     time.Time
+}
+
+func (IngestionJob) TableName() string {
+	return "ingestion_jobs"
 }

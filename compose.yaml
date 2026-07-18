@@ -16,5 +16,55 @@ services:
       retries: 10
     restart: unless-stopped
 
+  rustfs:
+    image: rustfs/rustfs:1.0.0-beta.10
+    # The webhook queue must exist before RustFS initializes notification
+    # targets. The image runs as the unprivileged rustfs user, which owns /data.
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        mkdir -p /data/.rustfs-events
+        exec /entrypoint.sh /data
+    environment:
+      RUSTFS_ACCESS_KEY: ${S3_ACCESS_KEY:-minioadmin}
+      RUSTFS_SECRET_KEY: ${S3_SECRET_KEY:-minioadmin}
+      RUSTFS_ADDRESS: :${S3_PORT:-9000}
+      RUSTFS_CONSOLE_ENABLE: "true"
+      RUSTFS_CONSOLE_ADDRESS: :${S3_CONSOLE_PORT:-9001}
+      # beta.10 can load its persisted notification switch before storage is
+      # ready. Environment-managed configuration makes the target deterministic
+      # on every container start instead of relying on a later admin API reload.
+      RUSTFS_NOTIFY_ENABLE: "true"
+      RUSTFS_NOTIFY_WEBHOOK_ENABLE_PRIMARY: "on"
+      # RustFS rejects literal loopback/private IP webhook URLs. Use a local
+      # development hostname and resolve it to loopback inside the container.
+      RUSTFS_NOTIFY_WEBHOOK_ENDPOINT_PRIMARY: http://semantic-search-ingester:${INGESTION_PORT:-8081}/events/s3
+      RUSTFS_NOTIFY_WEBHOOK_AUTH_TOKEN_PRIMARY: Bearer ${INGESTION_WEBHOOK_TOKEN:-local-development-token}
+      RUSTFS_NOTIFY_WEBHOOK_QUEUE_DIR_PRIMARY: /data/.rustfs-events
+    # The ingester runs on the Linux host. Host networking avoids host-firewall
+    # rules that can silently drop traffic arriving from a Docker bridge.
+    network_mode: host
+    extra_hosts:
+      - "semantic-search-ingester:127.0.0.1"
+    volumes:
+      - rustfs_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:${S3_PORT:-9000}/health/ready"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    restart: unless-stopped
+
+  storage-cli:
+    image: minio/mc:latest
+    profiles: ["tools"]
+    network_mode: host
+    environment:
+      S3_ENDPOINT: ${S3_ENDPOINT:-http://127.0.0.1:9000}
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:-minioadmin}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:-minioadmin}
+      S3_BUCKET: ${S3_BUCKET:-semantic-search}
+
 volumes:
   postgres_data:
+  rustfs_data:

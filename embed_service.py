@@ -1,3 +1,4 @@
+import asyncio
 import io
 import os
 from pathlib import Path
@@ -150,8 +151,18 @@ def embedding_response(vector: list[float]) -> dict:
     }
 
 
+def embed_image(image_bytes: bytes) -> dict:
+    """Run CPU/NPU-bound preprocessing and inference outside the event loop."""
+    tensor_data = preprocess_siglip2(image_bytes)
+    raw_output = vision_session.run(
+        [vision_embedding_output],
+        {vision_input_name: tensor_data},
+    )[0]
+    return embedding_response(normalize_embedding(raw_output))
+
+
 @app.get("/health")
-def health():
+async def health():
     return {
         "status": "ok",
         "model": MODEL_ID,
@@ -166,12 +177,7 @@ def health():
 async def get_image_embedding(file: UploadFile = File(...)):
     try:
         contents = await file.read()
-        tensor_data = preprocess_siglip2(contents)
-        raw_output = vision_session.run(
-            [vision_embedding_output],
-            {vision_input_name: tensor_data},
-        )[0]
-        return embedding_response(normalize_embedding(raw_output))
+        return await asyncio.to_thread(embed_image, contents)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 

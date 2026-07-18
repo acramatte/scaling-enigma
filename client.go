@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"semantic-search/internal/config"
 	appdb "semantic-search/internal/database"
 	"semantic-search/internal/embedder"
 	"semantic-search/internal/webapp"
@@ -36,6 +37,10 @@ func main() {
 	if len(os.Args) < 2 {
 		printUsage()
 		os.Exit(2)
+	}
+	if err := config.LoadDotEnv(); err != nil {
+		fmt.Fprintf(os.Stderr, "Environment configuration failed: %v\n", err)
+		os.Exit(1)
 	}
 
 	connectCtx, cancelConnect := context.WithTimeout(context.Background(), 5*time.Second)

@@ -7,7 +7,44 @@ The intended system has two core capabilities:
 - Multimodal representation: use the image and text towers from `google/siglip2-base-patch16-256` to project visual media and text queries into a shared vector space. That shared space enables natural-language search over local images and frames, such as `sunset over a mountain ridge` or `red running shoes`.
 - Local acceleration path: run embedding inference through AMD Ryzen AI when `VitisAIExecutionProvider` is available, with CPU fallback for development and environments where the NPU runtime is not active.
 
-Current status: the FastAPI service embeds images and text, the Go client indexes images, and pgvector ranks indexed images or video segments for a natural-language query.
+Current status: the FastAPI service embeds images and text; Go can index local
+files directly or ingest image uploads asynchronously from RustFS; and pgvector
+ranks indexed images or video segments for a natural-language query.
+
+## Data flows
+
+Asynchronous S3 ingestion:
+
+```text
+S3 upload
+  → RustFS object-created webhook
+  → Go ingester (`POST /events/s3`)
+  → PostgreSQL `ingestion_jobs` queue
+  → Go ingestion worker
+  → RustFS object download
+  → Python image embedder (`POST /embed/image`)
+  → PostgreSQL `documents` + pgvector `embeddings`
+```
+
+The webhook records durable work; it does not perform inference in the request.
+The Go worker polls and claims queued jobs, downloads the corresponding object,
+requests its image embedding, and saves the searchable document and vector.
+
+Natural-language search runs in the other direction from a user request:
+
+```text
+Search UI or CLI query
+  → Go search application
+  → Python text embedder (`POST /embed/text`)
+  → pgvector similarity query
+  → ranked documents returned to the user
+```
+
+Images and text use the two towers of the same SigLIP 2 checkpoint, which is why
+their vectors can be compared in a shared space.
+
+For S3 notification setup, retry semantics, operational boundaries, and
+troubleshooting, see [`internal/storage/README.md`](internal/storage/README.md).
 
 ## Setup
 
@@ -55,7 +92,8 @@ stores `source_uri` plus JSONB metadata, and `embeddings` stores the
 `vector(768)` rows linked back to documents. The vector size matches the current
 SigLIP embedding output. The second migration renames embeddings saved with the
 old vision-only model label so image and text queries consistently identify the
-shared `google/siglip2-base-patch16-256` checkpoint.
+shared `google/siglip2-base-patch16-256` checkpoint. The third migration creates
+the durable `ingestion_jobs` queue used by RustFS object notifications.
 
 ## Test the FastAPI embedding service
 
@@ -114,6 +152,18 @@ FastAPI also exposes interactive docs at:
 ```text
 http://127.0.0.1:8000/docs
 ```
+
+The image endpoint reads the uploaded body asynchronously, then uses
+`asyncio.to_thread` to run image preprocessing and ONNX inference outside the
+event-loop thread. Keep blocking `InferenceSession.run` calls outside the event
+loop so concurrent health and API requests remain responsive. The synchronous
+text endpoint is likewise offloaded by FastAPI automatically.
+
+There is not yet an explicit inference-concurrency limit. That limit should live
+in the embedding service—the owner of the ONNX sessions and hardware—so it also
+protects direct CLI, web, and future callers. The ingestion worker can
+additionally limit job concurrency for backpressure, but it must not be the only
+hardware guard.
 
 ## Install and test the text encoder
 
@@ -203,6 +253,90 @@ description, and the page will display the closest indexed documents. The
 server uses only Go's standard `net/http` and `html/template` packages for the
 web layer; it reuses the same text-embedding and pgvector search path as the
 CLI. Set `HTTP_ADDR` to change the listening address.
+
+## Object storage ingestion
+
+For the architecture, configuration rationale, debugging history, and recovery
+checklist, see [`internal/storage/README.md`](internal/storage/README.md).
+
+For local development, RustFS provides an S3-compatible `semantic-search`
+bucket. Start PostgreSQL, apply the ingestion-job migration, then run the Python
+embedder and Go ingestion service in separate terminals:
+
+```bash
+make db-up
+make migrate-up
+python embed_service.py
+go run ./cmd/ingester
+```
+
+The Go commands load `.env` automatically when it is present. Values already
+set in the process environment take precedence, so production and CI can use
+their normal environment configuration.
+
+In another terminal, start RustFS after the ingester is listening so RustFS can
+validate its webhook target and create the bucket notification:
+
+```bash
+make storage-up
+```
+
+`storage-up` creates the bucket and its notification rule. Use
+`make storage-configure` only to repair or reapply that configuration.
+`make storage-status` verifies that the runtime webhook target is online and
+displays the configured notification rules. `make storage-events` displays only
+the persisted rules and does not prove that their target is active.
+`storage-cli` is a profile-gated, disposable `minio/mc` client used only for
+bucket administration; it does not remain running with the stack. Old MinIO
+containers and volumes are not part of the current setup, and development
+objects were not migrated into RustFS automatically.
+
+Storage setup additionally requires Docker Compose, Python 3, and a `curl`
+build with AWS SigV4 support. The `mc` administration client runs through the
+disposable `storage-cli` container and does not need to be installed on the
+host.
+
+RustFS's S3 API is available at `http://127.0.0.1:9000` and its console at
+`http://127.0.0.1:9001`. The development credentials and bucket name are in
+`.env.example`.
+
+Upload an image under the `incoming/` prefix using the RustFS console or any
+S3-compatible client. For example, with the `mc` client installed:
+
+```bash
+mc alias set local http://127.0.0.1:9000 minioadmin minioadmin
+mc cp /path/to/drumkit.jpg local/semantic-search/incoming/drumkit.jpg
+```
+
+RustFS sends an `ObjectCreated` notification to `POST /events/s3`. The Go
+receiver records an idempotent PostgreSQL ingestion job and returns promptly;
+the worker then downloads the object, sends it to the Python image embedder,
+and stores an embedding with an `s3://semantic-search/incoming/drumkit.jpg`
+source URI. Repeated notifications for the same object version are safe.
+Transient download or embedding failures are retried up to three times with a
+short backoff before the job is marked `failed` for inspection.
+
+A duplicate notification does not automatically reactivate a terminal failed
+job. Retry one explicitly after correcting its root cause:
+
+```bash
+make ingestion-retry JOB_ID=<failed-job-id>
+```
+
+Webhook logs distinguish `inserted` from `duplicate`. A `duplicate` record
+means the notification arrived successfully but an ingestion job with the same
+bucket, key, version, and ETag already exists.
+
+On Linux, RustFS uses host networking so it can call the host-run ingester
+without Docker bridge firewall rules. The allowed local hostname
+`semantic-search-ingester` resolves to loopback inside the container; RustFS
+rejects literal loopback/private-IP webhook URLs. Keep
+`INGESTION_WEBHOOK_TOKEN` set; RustFS sends it as the webhook authorization
+value.
+
+The current worker intentionally marks non-image uploads, including videos, as
+`ignored`. Video ingestion will add frame extraction and create one embedding
+per segment using the existing segment fields.
 
 ## Database integration test
 
