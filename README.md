@@ -217,7 +217,7 @@ Apply any pending migrations, then index an image from another terminal:
 
 ```bash
 make migrate-up
-go run client.go index /home/alexis/Pictures/Screenshots/solutionpatterns.png
+go run ./cmd/search index /home/alexis/Pictures/Screenshots/solutionpatterns.png
 ```
 
 Expected output includes the request duration, embedding dimensionality, and the first few vector values:
@@ -232,7 +232,7 @@ First 5 dimensions: [0.0123 -0.0456 0.0789 0.0012 -0.0345]
 Search the indexed embeddings with natural language:
 
 ```bash
-go run client.go search sunset over a mountain ridge
+go run ./cmd/search search sunset over a mountain ridge
 ```
 
 The Go client asks the Python service for the normalized text embedding, then
@@ -245,7 +245,7 @@ With PostgreSQL and the FastAPI embedding service running, start the Go web
 server:
 
 ```bash
-go run client.go serve
+go run ./cmd/search serve
 ```
 
 Open [http://127.0.0.1:8080](http://127.0.0.1:8080), enter a natural-language
@@ -410,7 +410,7 @@ This split keeps the hardware/runtime-specific pieces isolated while leaving the
 
    The advantage: Go is a good fit for file walking, concurrency, database writes, request handling, and keeping the broader pipeline simple to deploy.
 
-   Current role: `client.go` indexes image embeddings and performs natural-language searches over the stored 768-dimensional vectors.
+   Current role: the Go search command indexes image embeddings, serves the browser UI, and performs natural-language searches over the stored 768-dimensional vectors.
 
    Intended role: a larger Go process can scan files, schedule embedding work, call the Python service over local HTTP, and store or compare vectors downstream.
 

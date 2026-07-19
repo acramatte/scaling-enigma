@@ -213,7 +213,7 @@ func optionalMilliseconds(value *int64) string {
 
 func printUsage() {
 	fmt.Fprintln(os.Stderr, "usage:")
-	fmt.Fprintln(os.Stderr, "  go run client.go index /path/to/image")
-	fmt.Fprintln(os.Stderr, "  go run client.go search natural language query")
-	fmt.Fprintln(os.Stderr, "  go run client.go serve")
+	fmt.Fprintln(os.Stderr, "  go run ./cmd/search index /path/to/image")
+	fmt.Fprintln(os.Stderr, "  go run ./cmd/search search natural language query")
+	fmt.Fprintln(os.Stderr, "  go run ./cmd/search serve")
 }
