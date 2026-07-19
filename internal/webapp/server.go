@@ -3,15 +3,24 @@ package webapp
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/base64"
 	"fmt"
 	"html/template"
+	"io"
 	"net/http"
+	"net/url"
+	"path/filepath"
 	"strings"
 	"time"
 	"unicode/utf8"
 
 	appdb "semantic-search/internal/database"
 	"semantic-search/internal/embedder"
+	"semantic-search/internal/storage"
 )
 
 const (
@@ -23,8 +32,10 @@ const (
 type searchFunc func(context.Context, string) ([]appdb.SearchResult, error)
 
 type server struct {
-	search   searchFunc
-	template *template.Template
+	search      searchFunc
+	template    *template.Template
+	imageStore  *storage.Store
+	imageSecret []byte
 }
 
 type pageData struct {
@@ -41,10 +52,12 @@ type resultView struct {
 	MediaType        string
 	CosineSimilarity string
 	Segment          string
+	ImageURL         string
 }
 
-// New returns the HTTP handler for the semantic-search page.
-func New(db *appdb.Store, client *embedder.Client) http.Handler {
+// New returns the HTTP handler for the semantic-search page and can proxy
+// s3:// result images when an object store is supplied.
+func New(db *appdb.Store, client *embedder.Client, imageStore *storage.Store) http.Handler {
 	return newHandler(func(ctx context.Context, query string) ([]appdb.SearchResult, error) {
 		embedding, err := client.GetTextEmbeddingContext(ctx, query)
 		if err != nil {
@@ -56,17 +69,27 @@ func New(db *appdb.Store, client *embedder.Client) http.Handler {
 			Model:  embedding.Model,
 			Limit:  searchLimit,
 		})
-	})
+	}, imageStore)
 }
 
-func newHandler(search searchFunc) http.Handler {
+func newHandler(search searchFunc, imageStore *storage.Store) http.Handler {
+	secret := make([]byte, 32)
+	if _, err := rand.Read(secret); err != nil {
+		panic(fmt.Sprintf("generate image token secret: %v", err))
+	}
 	return &server{
-		search:   search,
-		template: template.Must(template.New("search").Parse(pageTemplate)),
+		search:      search,
+		template:    template.Must(template.New("search").Parse(pageTemplate)),
+		imageStore:  imageStore,
+		imageSecret: secret,
 	}
 }
 
 func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/image" {
+		s.serveImage(w, r)
+		return
+	}
 	if r.URL.Path != "/" {
 		http.NotFound(w, r)
 		return
@@ -110,6 +133,7 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			MediaType:        result.MediaType,
 			CosineSimilarity: fmt.Sprintf("%.4f", result.Similarity),
 			Segment:          formatSegment(result),
+			ImageURL:         s.imageURL(result),
 		})
 	}
 
@@ -127,6 +151,100 @@ func (s *server) render(w http.ResponseWriter, status int, data pageData) {
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.WriteHeader(status)
 	_, _ = body.WriteTo(w)
+}
+
+func (s *server) imageURL(result appdb.SearchResult) string {
+	if result.MediaType != appdb.MediaTypeImage || s.imageStore == nil {
+		return ""
+	}
+	parsed, err := url.Parse(result.SourceURI)
+	if err != nil || parsed.Scheme != "s3" || parsed.Host == "" || strings.TrimPrefix(parsed.EscapedPath(), "/") == "" {
+		return ""
+	}
+	values := url.Values{}
+	values.Set("src", result.SourceURI)
+	values.Set("sig", s.signImageSource(result.SourceURI))
+	return "/image?" + values.Encode()
+}
+
+func (s *server) signImageSource(sourceURI string) string {
+	mac := hmac.New(sha256.New, s.imageSecret)
+	_, _ = mac.Write([]byte(sourceURI))
+	return base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+}
+
+func (s *server) validImageSignature(sourceURI, signature string) bool {
+	expected := s.signImageSource(sourceURI)
+	return subtle.ConstantTimeCompare([]byte(expected), []byte(signature)) == 1
+}
+
+func (s *server) serveImage(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	sourceURI := r.URL.Query().Get("src")
+	if sourceURI == "" || !s.validImageSignature(sourceURI, r.URL.Query().Get("sig")) {
+		http.NotFound(w, r)
+		return
+	}
+	parsed, err := url.Parse(sourceURI)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	switch parsed.Scheme {
+	case "s3":
+		s.serveS3Image(w, r, parsed)
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+func (s *server) serveS3Image(w http.ResponseWriter, r *http.Request, parsed *url.URL) {
+	if s.imageStore == nil {
+		http.NotFound(w, r)
+		return
+	}
+	key, err := url.PathUnescape(strings.TrimPrefix(parsed.EscapedPath(), "/"))
+	if err != nil || key == "" || parsed.Host == "" {
+		http.NotFound(w, r)
+		return
+	}
+	object, err := s.imageStore.Get(r.Context(), parsed.Host, key, parsed.Query().Get("versionId"))
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	defer object.Body.Close()
+	contentType := contentTypeForImage(key, object.ContentType)
+	if !strings.HasPrefix(contentType, "image/") {
+		http.Error(w, "unsupported image type", http.StatusUnsupportedMediaType)
+		return
+	}
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	_, _ = io.Copy(w, object.Body)
+}
+
+func contentTypeForImage(name, contentType string) string {
+	contentType = strings.TrimSpace(strings.Split(contentType, ";")[0])
+	if contentType != "" && contentType != "application/octet-stream" {
+		return contentType
+	}
+	switch strings.ToLower(filepath.Ext(name)) {
+	case ".jpg", ".jpeg":
+		return "image/jpeg"
+	case ".png":
+		return "image/png"
+	case ".gif":
+		return "image/gif"
+	case ".webp":
+		return "image/webp"
+	default:
+		return "application/octet-stream"
+	}
 }
 
 func formatSegment(result appdb.SearchResult) string {
@@ -159,7 +277,7 @@ const pageTemplate = `<!doctype html>
     :root { color-scheme: light; font-family: Inter, ui-sans-serif, system-ui, sans-serif; color: #18221c; background: #eef2ed; }
     * { box-sizing: border-box; }
     body { margin: 0; }
-    main { width: min(880px, calc(100% - 32px)); margin: 0 auto; padding: 72px 0; }
+    main { width: min(1040px, calc(100% - 32px)); margin: 0 auto; padding: 72px 0; }
     header { margin-bottom: 36px; }
     .eyebrow { margin: 0 0 10px; color: #397151; font-size: .78rem; font-weight: 800; letter-spacing: .13em; text-transform: uppercase; }
     h1 { margin: 0; max-width: 680px; font-family: Georgia, serif; font-size: clamp(2.5rem, 7vw, 5rem); font-weight: 500; line-height: .95; letter-spacing: -.045em; }
@@ -173,16 +291,18 @@ const pageTemplate = `<!doctype html>
     button:hover { background: #183e2a; }
     .summary { display: flex; justify-content: space-between; gap: 20px; margin: 38px 2px 14px; color: #526058; font-size: .9rem; }
     .summary strong { color: #18221c; }
-    ol { display: grid; gap: 12px; margin: 0; padding: 0; list-style: none; }
-    li { display: grid; grid-template-columns: 42px 1fr auto; gap: 16px; align-items: center; padding: 18px; border: 1px solid #d2dbd2; border-radius: 14px; background: rgba(255,255,255,.72); }
+    ol { display: grid; gap: 14px; margin: 0; padding: 0; list-style: none; }
+    li { display: grid; grid-template-columns: 42px 150px 1fr auto; gap: 16px; align-items: center; padding: 18px; border: 1px solid #d2dbd2; border-radius: 14px; background: rgba(255,255,255,.72); }
     .rank { display: grid; width: 38px; height: 38px; place-items: center; border-radius: 50%; color: #397151; background: #e0ede3; font-weight: 800; }
+    .thumbnail { width: 150px; height: 112px; object-fit: cover; border-radius: 11px; border: 1px solid #d2dbd2; background: #e7eee7; }
+    .thumbnail-placeholder { display: grid; width: 150px; height: 112px; place-items: center; border: 1px dashed #bdc9bf; border-radius: 11px; color: #68736c; background: #f4f7f3; font-size: .78rem; text-align: center; }
     .uri { overflow-wrap: anywhere; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: .9rem; }
     .meta { margin-top: 7px; color: #68736c; font-size: .8rem; text-transform: capitalize; }
     .score { color: #24543a; font-weight: 800; white-space: nowrap; }
     .empty, .error { margin-top: 22px; padding: 18px; border-radius: 12px; }
     .empty { border: 1px dashed #bdc9bf; color: #526058; }
     .error { border: 1px solid #e7b8b1; color: #792d25; background: #fff1ee; }
-    @media (max-width: 600px) { main { padding-top: 44px; } .search-row { flex-direction: column; } button { padding: 14px; } li { grid-template-columns: 38px 1fr; } .score { grid-column: 2; } }
+    @media (max-width: 760px) { main { padding-top: 44px; } .search-row { flex-direction: column; } button { padding: 14px; } li { grid-template-columns: 38px 1fr; } .thumbnail, .thumbnail-placeholder { grid-column: 2; width: 100%; max-width: 240px; } .score { grid-column: 2; } }
   </style>
 </head>
 <body>
@@ -209,6 +329,7 @@ const pageTemplate = `<!doctype html>
         {{range .Results}}
         <li>
           <span class="rank">{{.Rank}}</span>
+          {{if .ImageURL}}<img class="thumbnail" src="{{.ImageURL}}" alt="Search result {{.Rank}} preview" loading="lazy">{{else}}<div class="thumbnail-placeholder">No preview</div>{{end}}
           <div>
             <div class="uri">{{.SourceURI}}</div>
             <div class="meta">{{.MediaType}}{{if .Segment}} · {{.Segment}}{{end}}</div>

@@ -18,6 +18,7 @@ import (
 	"semantic-search/internal/config"
 	appdb "semantic-search/internal/database"
 	"semantic-search/internal/embedder"
+	"semantic-search/internal/storage"
 	"semantic-search/internal/webapp"
 )
 
@@ -96,9 +97,14 @@ func serve(db *appdb.Store, client *embedder.Client) error {
 		address = defaultHTTPAddress
 	}
 
+	imageStore, err := storage.NewFromEnvironment(context.Background())
+	if err != nil {
+		return fmt.Errorf("configure result image storage: %w", err)
+	}
+
 	server := &http.Server{
 		Addr:              address,
-		Handler:           webapp.New(db, client),
+		Handler:           webapp.New(db, client, imageStore),
 		ReadHeaderTimeout: 5 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
@@ -113,7 +119,7 @@ func serve(db *appdb.Store, client *embedder.Client) error {
 	}()
 
 	fmt.Printf("Semantic search UI listening on http://%s\n", address)
-	err := server.ListenAndServe()
+	err = server.ListenAndServe()
 	if errors.Is(err, http.ErrServerClosed) {
 		return nil
 	}

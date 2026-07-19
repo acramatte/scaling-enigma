@@ -249,10 +249,15 @@ go run client.go serve
 ```
 
 Open [http://127.0.0.1:8080](http://127.0.0.1:8080), enter a natural-language
-description, and the page will display the closest indexed documents. The
-server uses only Go's standard `net/http` and `html/template` packages for the
-web layer; it reuses the same text-embedding and pgvector search path as the
-CLI. Set `HTTP_ADDR` to change the listening address.
+description, and the page will display the closest indexed documents with image
+previews when the source URI is an `s3://` object reachable through the
+configured RustFS/S3 settings. The server proxies previews through signed
+`/image` URLs instead of handing raw bucket paths directly to the browser. Local
+`file://` results remain searchable for CLI-indexed development images, but the
+web UI deliberately does not serve files from the host filesystem. The web layer
+uses only Go's standard `net/http` and `html/template` packages; it reuses the
+same text-embedding and pgvector search path as the CLI. Set `HTTP_ADDR` to
+change the listening address.
 
 ## Object storage ingestion
 
