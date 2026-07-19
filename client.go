@@ -19,8 +19,6 @@ import (
 	appdb "semantic-search/internal/database"
 	"semantic-search/internal/embedder"
 	"semantic-search/internal/webapp"
-
-	"gorm.io/gorm"
 )
 
 const defaultEmbedderURL = "http://127.0.0.1:8000"
@@ -50,12 +48,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Database connection failed: %v\n", err)
 		os.Exit(1)
 	}
-	sqlDB, err := db.DB()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Database pool failed: %v\n", err)
-		os.Exit(1)
-	}
-	defer sqlDB.Close()
+	defer db.Close()
 
 	embedderURL := os.Getenv("EMBEDDER_URL")
 	if embedderURL == "" {
@@ -97,7 +90,7 @@ func main() {
 	}
 }
 
-func serve(db *gorm.DB, client *embedder.Client) error {
+func serve(db *appdb.Store, client *embedder.Client) error {
 	address := strings.TrimSpace(os.Getenv("HTTP_ADDR"))
 	if address == "" {
 		address = defaultHTTPAddress
@@ -127,7 +120,7 @@ func serve(db *gorm.DB, client *embedder.Client) error {
 	return fmt.Errorf("serve semantic search UI: %w", err)
 }
 
-func indexImage(db *gorm.DB, client *embedder.Client, path string) error {
+func indexImage(db *appdb.Store, client *embedder.Client, path string) error {
 	imagePath, err := filepath.Abs(path)
 	if err != nil {
 		return fmt.Errorf("resolve image path: %w", err)
@@ -143,7 +136,7 @@ func indexImage(db *gorm.DB, client *embedder.Client, path string) error {
 
 	saveCtx, cancelSave := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancelSave()
-	if err := appdb.SaveDocumentEmbedding(saveCtx, db, appdb.SaveEmbeddingInput{
+	if err := db.SaveDocumentEmbedding(saveCtx, appdb.SaveEmbeddingInput{
 		SourceURI:   sourceURI,
 		MediaType:   appdb.MediaTypeImage,
 		ContentType: mime.TypeByExtension(filepath.Ext(imagePath)),
@@ -167,7 +160,7 @@ func indexImage(db *gorm.DB, client *embedder.Client, path string) error {
 	return nil
 }
 
-func search(db *gorm.DB, client *embedder.Client, query string) error {
+func search(db *appdb.Store, client *embedder.Client, query string) error {
 	fmt.Printf("Searching for %q...\n", query)
 	embedding, err := client.GetTextEmbedding(query)
 	if err != nil {
@@ -176,7 +169,7 @@ func search(db *gorm.DB, client *embedder.Client, query string) error {
 
 	searchCtx, cancelSearch := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancelSearch()
-	results, err := appdb.SearchDocuments(searchCtx, db, appdb.SearchInput{
+	results, err := db.SearchDocuments(searchCtx, appdb.SearchInput{
 		Values: embedding.Values,
 		Model:  embedding.Model,
 		Limit:  10,

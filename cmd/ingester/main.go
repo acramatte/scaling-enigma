@@ -38,11 +38,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("database connection failed: %v", err)
 	}
-	sqlDB, err := db.DB()
-	if err != nil {
-		log.Fatalf("database pool failed: %v", err)
-	}
-	defer sqlDB.Close()
+	defer db.Close()
 
 	store, err := storage.NewFromEnvironment(ctx)
 	if err != nil {

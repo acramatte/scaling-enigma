@@ -1,0 +1,21 @@
+version: "2"
+
+sql:
+  - engine: "postgresql"
+    schema: "sql/migrations"
+    queries: "sql/queries"
+    gen:
+      go:
+        package: "dbsql"
+        out: "internal/database/dbsql"
+        sql_package: "pgx/v5"
+        emit_empty_slices: true
+        emit_pointers_for_null_types: true
+        emit_sql_as_comment: true
+        overrides:
+          - db_type: "vector"
+            nullable: false
+            go_type:
+              import: "github.com/pgvector/pgvector-go"
+              package: "pgvector"
+              type: "Vector"

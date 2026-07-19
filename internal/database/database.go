@@ -2,51 +2,62 @@ package database
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math"
 	"os"
 	"strings"
 	"time"
 
+	"semantic-search/internal/database/dbsql"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/pgvector/pgvector-go"
-	"gorm.io/driver/postgres"
-	"gorm.io/gorm"
-	"gorm.io/gorm/clause"
-	"gorm.io/gorm/logger"
+	pgxvector "github.com/pgvector/pgvector-go/pgx"
 )
 
 const defaultURL = "postgres://semantic_search:semantic_search@localhost:5432/semantic_search?sslmode=disable"
 
-// Open creates a GORM connection pool and verifies that PostgreSQL is reachable.
-// Set DATABASE_URL to override the local development connection string.
-func Open(ctx context.Context) (*gorm.DB, error) {
-	dsn := os.Getenv("DATABASE_URL")
+type Store struct {
+	pool    *pgxpool.Pool
+	queries *dbsql.Queries
+}
+
+// Open creates a pgx connection pool, registers pgvector's types on every
+// connection, and verifies that PostgreSQL is reachable. Set DATABASE_URL to
+// override the local development connection string.
+func Open(ctx context.Context) (*Store, error) {
+	dsn := strings.TrimSpace(os.Getenv("DATABASE_URL"))
 	if dsn == "" {
 		dsn = defaultURL
 	}
 
-	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{
-		Logger: logger.Default.LogMode(logger.Warn),
-	})
+	config, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		return nil, fmt.Errorf("parse postgres configuration: %w", err)
+	}
+	config.MaxConns = 10
+	config.MinIdleConns = 0
+	config.MaxConnIdleTime = 5 * time.Minute
+	config.MaxConnLifetime = time.Hour
+	config.AfterConnect = pgxvector.RegisterTypes
+
+	pool, err := pgxpool.NewWithConfig(ctx, config)
 	if err != nil {
 		return nil, fmt.Errorf("open postgres: %w", err)
 	}
-
-	sqlDB, err := db.DB()
-	if err != nil {
-		return nil, fmt.Errorf("get postgres connection pool: %w", err)
-	}
-	sqlDB.SetMaxOpenConns(10)
-	sqlDB.SetMaxIdleConns(5)
-	sqlDB.SetConnMaxIdleTime(5 * time.Minute)
-	sqlDB.SetConnMaxLifetime(time.Hour)
-
-	if err := sqlDB.PingContext(ctx); err != nil {
-		_ = sqlDB.Close()
+	if err := pool.Ping(ctx); err != nil {
+		pool.Close()
 		return nil, fmt.Errorf("ping postgres: %w", err)
 	}
 
-	return db, nil
+	return &Store{pool: pool, queries: dbsql.New(pool)}, nil
+}
+
+func (s *Store) Close() {
+	if s != nil && s.pool != nil {
+		s.pool.Close()
+	}
 }
 
 type SaveEmbeddingInput struct {
@@ -55,14 +66,14 @@ type SaveEmbeddingInput struct {
 	ContentType       string
 	DocumentMetadata  Metadata
 	Model             string
-	SegmentIndex      int
+	SegmentIndex      int32
 	StartMS           *int64
 	EndMS             *int64
 	EmbeddingMetadata Metadata
 	Values            []float64
 }
 
-func SaveDocumentEmbedding(ctx context.Context, db *gorm.DB, input SaveEmbeddingInput) error {
+func (s *Store) SaveDocumentEmbedding(ctx context.Context, input SaveEmbeddingInput) error {
 	sourceURI := strings.TrimSpace(input.SourceURI)
 	if sourceURI == "" {
 		return fmt.Errorf("source URI is required")
@@ -88,76 +99,58 @@ func SaveDocumentEmbedding(ctx context.Context, db *gorm.DB, input SaveEmbedding
 	if mediaType == "" {
 		mediaType = MediaTypeUnknown
 	}
-
 	model := strings.TrimSpace(input.Model)
 	if model == "" {
 		model = DefaultEmbeddingModel
 	}
 
-	documentMetadata := input.DocumentMetadata
-	if documentMetadata == nil {
-		documentMetadata = Metadata{}
+	documentMetadata, err := marshalMetadata(input.DocumentMetadata)
+	if err != nil {
+		return fmt.Errorf("encode document metadata: %w", err)
+	}
+	embeddingMetadata, err := marshalMetadata(input.EmbeddingMetadata)
+	if err != nil {
+		return fmt.Errorf("encode embedding metadata: %w", err)
 	}
 
-	embeddingMetadata := input.EmbeddingMetadata
-	if embeddingMetadata == nil {
-		embeddingMetadata = Metadata{}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin embedding transaction: %w", err)
 	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	queries := s.queries.WithTx(tx)
 
-	return db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		document := Document{
-			SourceURI:   sourceURI,
-			MediaType:   mediaType,
-			ContentType: strings.TrimSpace(input.ContentType),
-			Metadata:    documentMetadata,
-		}
-
-		err := tx.Clauses(
-			clause.OnConflict{
-				Columns: []clause.Column{{Name: "source_uri"}},
-				DoUpdates: clause.Assignments(map[string]any{
-					"media_type":   gorm.Expr("EXCLUDED.media_type"),
-					"content_type": gorm.Expr("EXCLUDED.content_type"),
-					"metadata":     gorm.Expr("EXCLUDED.metadata"),
-					"updated_at":   gorm.Expr("CURRENT_TIMESTAMP"),
-				}),
-			},
-			clause.Returning{},
-		).Create(&document).Error
-		if err != nil {
-			return fmt.Errorf("save document: %w", err)
-		}
-
-		embedding := Embedding{
-			DocumentID:   document.ID,
-			Model:        model,
-			SegmentIndex: input.SegmentIndex,
-			StartMS:      input.StartMS,
-			EndMS:        input.EndMS,
-			Vector:       vector,
-			Metadata:     embeddingMetadata,
-		}
-
-		err = tx.Clauses(clause.OnConflict{
-			Columns: []clause.Column{
-				{Name: "document_id"},
-				{Name: "model"},
-				{Name: "segment_index"},
-			},
-			DoUpdates: clause.Assignments(map[string]any{
-				"start_ms":   gorm.Expr("EXCLUDED.start_ms"),
-				"end_ms":     gorm.Expr("EXCLUDED.end_ms"),
-				"embedding":  gorm.Expr("EXCLUDED.embedding"),
-				"metadata":   gorm.Expr("EXCLUDED.metadata"),
-				"updated_at": gorm.Expr("CURRENT_TIMESTAMP"),
-			}),
-		}).Create(&embedding).Error
-		if err != nil {
-			return fmt.Errorf("save embedding: %w", err)
-		}
-
-		return nil
+	documentID, err := queries.UpsertDocument(ctx, dbsql.UpsertDocumentParams{
+		SourceUri:   sourceURI,
+		MediaType:   mediaType,
+		ContentType: strings.TrimSpace(input.ContentType),
+		Metadata:    documentMetadata,
 	})
+	if err != nil {
+		return fmt.Errorf("save document: %w", err)
+	}
+	if err := queries.UpsertEmbedding(ctx, dbsql.UpsertEmbeddingParams{
+		DocumentID:   documentID,
+		Model:        model,
+		SegmentIndex: input.SegmentIndex,
+		StartMs:      input.StartMS,
+		EndMs:        input.EndMS,
+		Embedding:    vector,
+		Metadata:     embeddingMetadata,
+	}); err != nil {
+		return fmt.Errorf("save embedding: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit embedding transaction: %w", err)
+	}
+	return nil
+}
+
+func marshalMetadata(metadata Metadata) ([]byte, error) {
+	if metadata == nil {
+		metadata = Metadata{}
+	}
+	return json.Marshal(metadata)
 }
 
 func newVector(values []float64) (pgvector.Vector, error) {
@@ -176,6 +169,5 @@ func newVector(values []float64) (pgvector.Vector, error) {
 		}
 		converted[index] = float32(value)
 	}
-
 	return pgvector.NewVector(converted), nil
 }

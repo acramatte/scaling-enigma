@@ -12,8 +12,6 @@ import (
 
 	appdb "semantic-search/internal/database"
 	"semantic-search/internal/embedder"
-
-	"gorm.io/gorm"
 )
 
 const (
@@ -46,14 +44,14 @@ type resultView struct {
 }
 
 // New returns the HTTP handler for the semantic-search page.
-func New(db *gorm.DB, client *embedder.Client) http.Handler {
+func New(db *appdb.Store, client *embedder.Client) http.Handler {
 	return newHandler(func(ctx context.Context, query string) ([]appdb.SearchResult, error) {
 		embedding, err := client.GetTextEmbeddingContext(ctx, query)
 		if err != nil {
 			return nil, fmt.Errorf("embed text query: %w", err)
 		}
 
-		return appdb.SearchDocuments(ctx, db, appdb.SearchInput{
+		return db.SearchDocuments(ctx, appdb.SearchInput{
 			Values: embedding.Values,
 			Model:  embedding.Model,
 			Limit:  searchLimit,

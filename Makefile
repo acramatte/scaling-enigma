@@ -2,12 +2,13 @@
 
 DATABASE_URL ?= postgres://semantic_search:semantic_search@localhost:5432/semantic_search?sslmode=disable
 GOOSE_VERSION ?= v3.27.0
+SQLC_VERSION ?= v1.31.1
 
 # RustFS does not include an S3 administration client. Run minio/mc through the
 # profile-gated storage-cli service as a disposable container for bucket tasks.
 STORAGE_CLI := docker compose run --rm --no-deps --entrypoint /bin/sh storage-cli
 
-.PHONY: db-up db-down db-psql db-reset-dev ingestion-retry migrate-up migrate-down migrate-status test-integration tools storage-up storage-down storage-configure storage-events storage-status stack-down
+.PHONY: db-up db-down db-psql db-reset-dev ingestion-retry migrate-up migrate-down migrate-status sql-generate sql-verify test-integration tools storage-up storage-down storage-configure storage-events storage-status stack-down
 
 db-up:
 	docker compose up -d --wait postgres
@@ -71,16 +72,26 @@ db-reset-dev:
 	$(MAKE) migrate-up
 
 migrate-up:
-	goose -dir migrations postgres "$(DATABASE_URL)" up
+	goose -dir sql/migrations postgres "$(DATABASE_URL)" up
 
 migrate-down:
-	goose -dir migrations postgres "$(DATABASE_URL)" down
+	goose -dir sql/migrations postgres "$(DATABASE_URL)" down
 
 migrate-status:
-	goose -dir migrations postgres "$(DATABASE_URL)" status
+	goose -dir sql/migrations postgres "$(DATABASE_URL)" status
+
+sql-generate:
+	sqlc generate
+
+sql-verify:
+	sqlc vet
+	sqlc generate
+	git diff --exit-code -- internal/database/dbsql
+	@test -z "$$(git ls-files --others --exclude-standard -- internal/database/dbsql)" || { git status --short --untracked-files=all -- internal/database/dbsql; exit 1; }
 
 test-integration:
 	go test -count=1 -tags=integration ./internal/database
 
 tools:
 	go install github.com/pressly/goose/v3/cmd/goose@$(GOOSE_VERSION)
+	go install github.com/sqlc-dev/sqlc/cmd/sqlc@$(SQLC_VERSION)

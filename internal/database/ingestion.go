@@ -2,12 +2,15 @@ package database
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 
-	"gorm.io/gorm"
-	"gorm.io/gorm/clause"
+	"semantic-search/internal/database/dbsql"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 type EnqueueIngestionJobInput struct {
@@ -21,134 +24,115 @@ type EnqueueIngestionJobInput struct {
 
 // EnqueueIngestionJob records an object event once and reports whether a new
 // row was inserted. Repeated notifications for the same identity are ignored.
-func EnqueueIngestionJob(ctx context.Context, db *gorm.DB, input EnqueueIngestionJobInput) (bool, error) {
-	if strings.TrimSpace(input.Bucket) == "" || strings.TrimSpace(input.ObjectKey) == "" {
+func (s *Store) EnqueueIngestionJob(ctx context.Context, input EnqueueIngestionJobInput) (bool, error) {
+	bucket := strings.TrimSpace(input.Bucket)
+	if bucket == "" || strings.TrimSpace(input.ObjectKey) == "" {
 		return false, fmt.Errorf("ingestion job bucket and object key are required")
 	}
 	if input.SizeBytes != nil && *input.SizeBytes < 0 {
 		return false, fmt.Errorf("ingestion job size must be non-negative")
 	}
 
-	job := IngestionJob{
-		Bucket:        strings.TrimSpace(input.Bucket),
-		ObjectKey:     strings.TrimSpace(input.ObjectKey),
+	inserted, err := s.queries.EnqueueIngestionJob(ctx, dbsql.EnqueueIngestionJobParams{
+		Bucket:        bucket,
+		ObjectKey:     input.ObjectKey,
 		ObjectVersion: strings.TrimSpace(input.ObjectVersion),
-		ETag:          strings.Trim(strings.TrimSpace(input.ETag), "\""),
+		Etag:          strings.Trim(strings.TrimSpace(input.ETag), `"`),
 		SizeBytes:     input.SizeBytes,
 		ContentType:   strings.TrimSpace(input.ContentType),
-		Status:        IngestionJobPending,
-		AvailableAt:   time.Now().UTC(),
+	})
+	if err != nil {
+		return false, fmt.Errorf("enqueue ingestion job: %w", err)
 	}
-
-	result := db.WithContext(ctx).Clauses(clause.OnConflict{DoNothing: true}).Create(&job)
-	if result.Error != nil {
-		return false, result.Error
-	}
-	return result.RowsAffected == 1, nil
+	return inserted, nil
 }
 
 // RequeueFailedIngestionJob explicitly gives a terminal failed job a fresh set
 // of worker attempts. Other states are left unchanged so this operation cannot
 // race a pending or processing job.
-func RequeueFailedIngestionJob(ctx context.Context, db *gorm.DB, id int64) error {
+func (s *Store) RequeueFailedIngestionJob(ctx context.Context, id int64) error {
 	if id <= 0 {
 		return fmt.Errorf("ingestion job ID must be positive")
 	}
-	now := time.Now().UTC()
-	result := db.WithContext(ctx).Model(&IngestionJob{}).
-		Where("id = ? AND status = ?", id, IngestionJobFailed).
-		Updates(map[string]any{
-			"status":       IngestionJobPending,
-			"attempts":     0,
-			"last_error":   "",
-			"available_at": now,
-			"started_at":   nil,
-			"completed_at": nil,
-			"updated_at":   now,
-		})
-	if result.Error != nil {
-		return fmt.Errorf("requeue failed ingestion job: %w", result.Error)
-	}
-	if result.RowsAffected != 1 {
-		return fmt.Errorf("ingestion job %d does not exist or is not failed", id)
+	if _, err := s.queries.RequeueFailedIngestionJob(ctx, id); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return fmt.Errorf("ingestion job %d does not exist or is not failed", id)
+		}
+		return fmt.Errorf("requeue ingestion job %d: %w", id, err)
 	}
 	return nil
 }
 
-// ClaimIngestionJob obtains one ready job without competing workers processing
-// the same record. A nil job means there is no work available.
-func ClaimIngestionJob(ctx context.Context, db *gorm.DB) (*IngestionJob, error) {
-	var job IngestionJob
-	err := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		result := tx.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).
-			Where("status = ? AND available_at <= ?", IngestionJobPending, time.Now().UTC()).
-			Order("available_at, id").
-			Limit(1).
-			Find(&job)
-		if result.Error != nil {
-			return result.Error
-		}
-		if result.RowsAffected == 0 {
-			return nil
-		}
-
-		now := time.Now().UTC()
-		return tx.Model(&job).Updates(map[string]any{
-			"status":     IngestionJobProcessing,
-			"attempts":   gorm.Expr("attempts + 1"),
-			"started_at": now,
-			"updated_at": now,
-		}).Error
-	})
+// ClaimIngestionJob atomically obtains and marks one ready job so competing
+// workers cannot process the same record. A nil job means there is no work.
+func (s *Store) ClaimIngestionJob(ctx context.Context) (*IngestionJob, error) {
+	row, err := s.queries.ClaimIngestionJob(ctx)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
 	if err != nil {
 		return nil, fmt.Errorf("claim ingestion job: %w", err)
 	}
-	if job.ID == 0 {
-		return nil, nil
-	}
-	job.Status = IngestionJobProcessing
-	job.Attempts++
-	return &job, nil
+	return ingestionJobFromRow(row), nil
 }
 
-func CompleteIngestionJob(ctx context.Context, db *gorm.DB, id int64, status string, reason string) error {
+func (s *Store) CompleteIngestionJob(ctx context.Context, id int64, status string, reason string) error {
 	if status != IngestionJobCompleted && status != IngestionJobIgnored && status != IngestionJobFailed {
 		return fmt.Errorf("invalid terminal ingestion job status %q", status)
 	}
-	now := time.Now().UTC()
-	result := db.WithContext(ctx).Model(&IngestionJob{}).
-		Where("id = ? AND status = ?", id, IngestionJobProcessing).
-		Updates(map[string]any{
-			"status":       status,
-			"last_error":   reason,
-			"completed_at": now,
-			"updated_at":   now,
-		})
-	if result.Error != nil {
-		return fmt.Errorf("complete ingestion job: %w", result.Error)
-	}
-	if result.RowsAffected != 1 {
-		return fmt.Errorf("ingestion job %d is not being processed", id)
+	if _, err := s.queries.CompleteIngestionJob(ctx, dbsql.CompleteIngestionJobParams{
+		TerminalStatus: status,
+		Reason:         reason,
+		ID:             id,
+	}); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return fmt.Errorf("ingestion job %d was not processing", id)
+		}
+		return fmt.Errorf("complete ingestion job %d: %w", id, err)
 	}
 	return nil
 }
 
 // RetryIngestionJob puts a processing job back into the ready queue after a
 // transient failure. Attempts are incremented when the job is claimed.
-func RetryIngestionJob(ctx context.Context, db *gorm.DB, id int64, availableAt time.Time, reason string) error {
-	result := db.WithContext(ctx).Model(&IngestionJob{}).
-		Where("id = ? AND status = ?", id, IngestionJobProcessing).
-		Updates(map[string]any{
-			"status":       IngestionJobPending,
-			"available_at": availableAt.UTC(),
-			"last_error":   reason,
-			"updated_at":   time.Now().UTC(),
-		})
-	if result.Error != nil {
-		return fmt.Errorf("retry ingestion job: %w", result.Error)
-	}
-	if result.RowsAffected != 1 {
-		return fmt.Errorf("ingestion job %d is not being processed", id)
+func (s *Store) RetryIngestionJob(ctx context.Context, id int64, availableAt time.Time, reason string) error {
+	if _, err := s.queries.RetryIngestionJob(ctx, dbsql.RetryIngestionJobParams{
+		AvailableAt: pgtype.Timestamptz{Time: availableAt.UTC(), Valid: true},
+		Reason:      reason,
+		ID:          id,
+	}); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return fmt.Errorf("ingestion job %d was not processing", id)
+		}
+		return fmt.Errorf("retry ingestion job %d: %w", id, err)
 	}
 	return nil
+}
+
+func ingestionJobFromRow(row dbsql.IngestionJob) *IngestionJob {
+	return &IngestionJob{
+		ID:            row.ID,
+		Bucket:        row.Bucket,
+		ObjectKey:     row.ObjectKey,
+		ObjectVersion: row.ObjectVersion,
+		ETag:          row.Etag,
+		SizeBytes:     row.SizeBytes,
+		ContentType:   row.ContentType,
+		Status:        row.Status,
+		Attempts:      int(row.Attempts),
+		LastError:     row.LastError,
+		AvailableAt:   row.AvailableAt.Time,
+		StartedAt:     timestampPointer(row.StartedAt),
+		CompletedAt:   timestampPointer(row.CompletedAt),
+		CreatedAt:     row.CreatedAt.Time,
+		UpdatedAt:     row.UpdatedAt.Time,
+	}
+}
+
+func timestampPointer(value pgtype.Timestamptz) *time.Time {
+	if !value.Valid {
+		return nil
+	}
+	timestamp := value.Time
+	return &timestamp
 }

@@ -338,6 +338,26 @@ The current worker intentionally marks non-image uploads, including videos, as
 `ignored`. Video ingestion will add frame extraction and create one embedding
 per segment using the existing segment fields.
 
+## Database development
+
+Goose migrations under `sql/migrations/` are the executable schema history and
+the schema input for sqlc. Keeping one source of truth avoids a separate
+snapshot drifting from the migrations. Handwritten queries live under
+`sql/queries/`; regenerate their pgx wrappers after changing a query or
+migration:
+
+```bash
+make sql-generate
+```
+
+Generated code is committed under `internal/database/dbsql/` and must not be
+edited directly. `internal/database/models.go` remains handwritten and contains
+the domain-facing constants and models, while `database.Store` owns the pgx
+pool, validation, transactions, and conversion from generated persistence
+types. Run `make sql-verify` before committing to vet the SQL and confirm the
+committed generated code is current. `make tools` installs the pinned Goose and
+sqlc command versions when they are not already available.
+
 ## Database integration test
 
 Run the search integration test in a disposable pgvector container:
@@ -347,10 +367,12 @@ make test-integration
 ```
 
 Testcontainers starts the same PostgreSQL/pgvector image used by Compose on a
-random host port, and Goose applies the embedded project migrations. The test
-writes its fixtures inside a transaction that is rolled back, then removes the
-container. It verifies cosine ordering, model and media filters, limits, JSONB
-metadata, and video segment timing without touching the development database.
+random host port, and Goose applies the embedded project migrations. Each test
+uses a disposable database and removes its container afterward. The suite
+verifies cosine ordering, model and media filters, limits, JSONB metadata,
+video segment timing, idempotent notification insertion, guarded retries, exact
+object-key preservation, and concurrent `SKIP LOCKED` queue claims without
+touching the development database.
 
 ## Architecture: Why Python + Go?
 

@@ -4,67 +4,28 @@ package database
 
 import (
 	"context"
+	"database/sql"
 	"math"
 	"testing"
 	"time"
 
-	appmigrations "semantic-search/migrations"
+	appmigrations "semantic-search/sql/migrations"
 
+	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/pressly/goose/v3"
 	"github.com/testcontainers/testcontainers-go"
 	postgrescontainer "github.com/testcontainers/testcontainers-go/modules/postgres"
-	"gorm.io/gorm"
 )
 
 func TestSearchDocumentsIntegration(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
-	container, err := postgrescontainer.Run(
-		ctx,
-		"pgvector/pgvector:pg18-trixie",
-		postgrescontainer.WithDatabase("semantic_search_test"),
-		postgrescontainer.WithUsername("semantic_search"),
-		postgrescontainer.WithPassword("semantic_search"),
-		postgrescontainer.BasicWaitStrategies(),
-	)
-	if err != nil {
-		t.Fatalf("start pgvector container: %v", err)
-	}
-	testcontainers.CleanupContainer(t, container)
-
-	testDatabaseURL, err := container.ConnectionString(ctx, "sslmode=disable")
-	if err != nil {
-		t.Fatalf("get test database URL: %v", err)
-	}
-	t.Setenv("DATABASE_URL", testDatabaseURL)
-
-	db, err := Open(ctx)
-	if err != nil {
-		t.Fatalf("open test database: %v", err)
-	}
-	sqlDB, err := db.DB()
-	if err != nil {
-		t.Fatalf("get test database pool: %v", err)
-	}
-	defer sqlDB.Close()
-	provider, err := goose.NewProvider(goose.DialectPostgres, sqlDB, appmigrations.Files)
-	if err != nil {
-		t.Fatalf("create Goose provider: %v", err)
-	}
-	if _, err := provider.Up(ctx); err != nil {
-		t.Fatalf("apply test migrations: %v", err)
-	}
-
-	tx := db.Begin()
-	if tx.Error != nil {
-		t.Fatalf("begin test transaction: %v", tx.Error)
-	}
-	defer tx.Rollback()
+	db := openIntegrationStore(t, ctx)
 
 	startMS := int64(1_000)
 	endMS := int64(2_000)
-	saveIntegrationEmbedding(t, ctx, tx, SaveEmbeddingInput{
+	saveIntegrationEmbedding(t, ctx, db, SaveEmbeddingInput{
 		SourceURI:   "test://search/exact-image",
 		MediaType:   MediaTypeImage,
 		ContentType: "image/jpeg",
@@ -76,7 +37,7 @@ func TestSearchDocumentsIntegration(t *testing.T) {
 		},
 		Values: integrationVector(1, 0),
 	})
-	saveIntegrationEmbedding(t, ctx, tx, SaveEmbeddingInput{
+	saveIntegrationEmbedding(t, ctx, db, SaveEmbeddingInput{
 		SourceURI:    "test://search/video-segment",
 		MediaType:    MediaTypeVideo,
 		ContentType:  "video/mp4",
@@ -91,14 +52,14 @@ func TestSearchDocumentsIntegration(t *testing.T) {
 		},
 		Values: integrationVector(0.8, 0.6),
 	})
-	saveIntegrationEmbedding(t, ctx, tx, SaveEmbeddingInput{
+	saveIntegrationEmbedding(t, ctx, db, SaveEmbeddingInput{
 		SourceURI: "test://search/other-model",
 		MediaType: MediaTypeImage,
 		Model:     "different-checkpoint",
 		Values:    integrationVector(1, 0),
 	})
 
-	results, err := SearchDocuments(ctx, tx, SearchInput{
+	results, err := db.SearchDocuments(ctx, SearchInput{
 		Values: integrationVector(1, 0),
 	})
 	if err != nil {
@@ -143,7 +104,7 @@ func TestSearchDocumentsIntegration(t *testing.T) {
 		t.Errorf("expected end_ms %d, got %d", endMS, *segment.EndMS)
 	}
 
-	videoResults, err := SearchDocuments(ctx, tx, SearchInput{
+	videoResults, err := db.SearchDocuments(ctx, SearchInput{
 		Values:    integrationVector(1, 0),
 		MediaType: MediaTypeVideo,
 	})
@@ -154,7 +115,7 @@ func TestSearchDocumentsIntegration(t *testing.T) {
 		t.Errorf("media filter returned unexpected results: %#v", videoResults)
 	}
 
-	otherModelResults, err := SearchDocuments(ctx, tx, SearchInput{
+	otherModelResults, err := db.SearchDocuments(ctx, SearchInput{
 		Values: integrationVector(1, 0),
 		Model:  "different-checkpoint",
 	})
@@ -165,7 +126,7 @@ func TestSearchDocumentsIntegration(t *testing.T) {
 		t.Errorf("model filter returned unexpected results: %#v", otherModelResults)
 	}
 
-	limitedResults, err := SearchDocuments(ctx, tx, SearchInput{
+	limitedResults, err := db.SearchDocuments(ctx, SearchInput{
 		Values: integrationVector(1, 0),
 		Limit:  1,
 	})
@@ -177,9 +138,55 @@ func TestSearchDocumentsIntegration(t *testing.T) {
 	}
 }
 
-func saveIntegrationEmbedding(t *testing.T, ctx context.Context, db *gorm.DB, input SaveEmbeddingInput) {
+func openIntegrationStore(t *testing.T, ctx context.Context) *Store {
 	t.Helper()
-	if err := SaveDocumentEmbedding(ctx, db, input); err != nil {
+	container, err := postgrescontainer.Run(
+		ctx,
+		"pgvector/pgvector:pg18-trixie",
+		postgrescontainer.WithDatabase("semantic_search_test"),
+		postgrescontainer.WithUsername("semantic_search"),
+		postgrescontainer.WithPassword("semantic_search"),
+		postgrescontainer.BasicWaitStrategies(),
+	)
+	if err != nil {
+		t.Fatalf("start pgvector container: %v", err)
+	}
+	testcontainers.CleanupContainer(t, container)
+
+	databaseURL, err := container.ConnectionString(ctx, "sslmode=disable")
+	if err != nil {
+		t.Fatalf("get test database URL: %v", err)
+	}
+	t.Setenv("DATABASE_URL", databaseURL)
+
+	migrationDB, err := sql.Open("pgx", databaseURL)
+	if err != nil {
+		t.Fatalf("open migration database: %v", err)
+	}
+	provider, err := goose.NewProvider(goose.DialectPostgres, migrationDB, appmigrations.Files)
+	if err != nil {
+		migrationDB.Close()
+		t.Fatalf("create Goose provider: %v", err)
+	}
+	if _, err := provider.Up(ctx); err != nil {
+		migrationDB.Close()
+		t.Fatalf("apply test migrations: %v", err)
+	}
+	if err := migrationDB.Close(); err != nil {
+		t.Fatalf("close migration database: %v", err)
+	}
+
+	store, err := Open(ctx)
+	if err != nil {
+		t.Fatalf("open test database: %v", err)
+	}
+	t.Cleanup(store.Close)
+	return store
+}
+
+func saveIntegrationEmbedding(t *testing.T, ctx context.Context, db *Store, input SaveEmbeddingInput) {
+	t.Helper()
+	if err := db.SaveDocumentEmbedding(ctx, input); err != nil {
 		t.Fatalf("save integration embedding %q: %v", input.SourceURI, err)
 	}
 }

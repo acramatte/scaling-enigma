@@ -15,12 +15,10 @@ import (
 	appdb "semantic-search/internal/database"
 	"semantic-search/internal/embedder"
 	"semantic-search/internal/storage"
-
-	"gorm.io/gorm"
 )
 
 type Service struct {
-	db       *gorm.DB
+	db       *appdb.Store
 	store    *storage.Store
 	embedder *embedder.Client
 	token    string
@@ -49,14 +47,14 @@ type eventRecord struct {
 	} `json:"s3"`
 }
 
-func New(db *gorm.DB, store *storage.Store, client *embedder.Client, webhookToken string) *Service {
+func New(db *appdb.Store, store *storage.Store, client *embedder.Client, webhookToken string) *Service {
 	return &Service{
 		db:       db,
 		store:    store,
 		embedder: client,
 		token:    strings.TrimSpace(webhookToken),
 		enqueue: func(ctx context.Context, input appdb.EnqueueIngestionJobInput) (bool, error) {
-			return appdb.EnqueueIngestionJob(ctx, db, input)
+			return db.EnqueueIngestionJob(ctx, input)
 		},
 	}
 }
@@ -146,12 +144,12 @@ func (s *Service) Run(ctx context.Context, interval time.Duration) error {
 }
 
 func (s *Service) ProcessNext(ctx context.Context) error {
-	job, err := appdb.ClaimIngestionJob(ctx, s.db)
+	job, err := s.db.ClaimIngestionJob(ctx)
 	if err != nil || job == nil {
 		return err
 	}
 	if !isImage(job.ContentType, job.ObjectKey) {
-		return appdb.CompleteIngestionJob(ctx, s.db, job.ID, appdb.IngestionJobIgnored, "only image ingestion is implemented")
+		return s.db.CompleteIngestionJob(ctx, job.ID, appdb.IngestionJobIgnored, "only image ingestion is implemented")
 	}
 
 	object, err := s.store.Get(ctx, job.Bucket, job.ObjectKey, job.ObjectVersion)
@@ -169,7 +167,7 @@ func (s *Service) ProcessNext(ctx context.Context) error {
 	}
 
 	sourceURI := (&url.URL{Scheme: "s3", Host: job.Bucket, Path: "/" + job.ObjectKey}).String()
-	if err := appdb.SaveDocumentEmbedding(ctx, s.db, appdb.SaveEmbeddingInput{
+	if err := s.db.SaveDocumentEmbedding(ctx, appdb.SaveEmbeddingInput{
 		SourceURI:   sourceURI,
 		MediaType:   appdb.MediaTypeImage,
 		ContentType: contentType,
@@ -186,15 +184,15 @@ func (s *Service) ProcessNext(ctx context.Context) error {
 	}); err != nil {
 		return s.fail(ctx, job, fmt.Errorf("save embedding: %w", err))
 	}
-	return appdb.CompleteIngestionJob(ctx, s.db, job.ID, appdb.IngestionJobCompleted, "")
+	return s.db.CompleteIngestionJob(ctx, job.ID, appdb.IngestionJobCompleted, "")
 }
 
 func (s *Service) fail(ctx context.Context, job *appdb.IngestionJob, err error) error {
 	if job.Attempts >= maxAttempts {
-		return appdb.CompleteIngestionJob(ctx, s.db, job.ID, appdb.IngestionJobFailed, err.Error())
+		return s.db.CompleteIngestionJob(ctx, job.ID, appdb.IngestionJobFailed, err.Error())
 	}
 	backoff := time.Duration(job.Attempts) * time.Second
-	return appdb.RetryIngestionJob(ctx, s.db, job.ID, time.Now().Add(backoff), err.Error())
+	return s.db.RetryIngestionJob(ctx, job.ID, time.Now().Add(backoff), err.Error())
 }
 
 func isImage(contentType, objectKey string) bool {
