@@ -2,10 +2,9 @@
 
 This project is a fully local semantic search engine for visual media, focused on images and video frames. The goal is to generate searchable embeddings on-device without depending on cloud APIs, avoiding network latency, external service cost, and remote data exposure.
 
-The intended system has two core capabilities:
+The intended system has one core capability:
 
 - Multimodal representation: use the image and text towers from `google/siglip2-base-patch16-256` to project visual media and text queries into a shared vector space. That shared space enables natural-language search over local images and frames, such as `sunset over a mountain ridge` or `red running shoes`.
-- Local acceleration path: run embedding inference through AMD Ryzen AI when `VitisAIExecutionProvider` is available, with CPU fallback for development and environments where the NPU runtime is not active.
 
 Current status: the FastAPI service embeds images and text; Go can index local
 files directly or ingest image uploads asynchronously from RustFS; and pgvector
@@ -45,19 +44,6 @@ their vectors can be compared in a shared space.
 
 For S3 notification setup, retry semantics, operational boundaries, and
 troubleshooting, see [`internal/storage/README.md`](internal/storage/README.md).
-
-## Setup
-
-Test installation:
-
-```
-conda activate ryzen-ai-1.7.1
-```
-
-
-```
-source /opt/AMD/ryzenai/venv/bin/activate.fish
-```
 
 ## PostgreSQL and pgvector
 
@@ -381,30 +367,25 @@ touching the development database.
 
 ## Architecture: Why Python + Go?
 
-This project uses a hybrid dual-runtime architecture split between Go and Python. Go is the intended orchestration layer, while Python owns the ONNX/Ryzen AI execution path and can fall back to CPU execution when the VitisAI provider is not available.
+This project uses a hybrid dual-runtime architecture split between Go and Python. Go is the orchestration layer, while Python owns local ONNX Runtime inference on CPU.
 
 ```text
 ┌────────────────────────┐         HTTP / JSON         ┌────────────────────────┐
 │      Go Backend        │ ──────────────────────────> │   Python AI Service    │
 │  (Orchestrator, DB,    │ <────────────────────────── │  (FastAPI, ONNX, ORT)  │
 │   File Processing)     │       Embeddings Output     └────────────────────────┘
-└────────────────────────┘                                         │
-                                                                   ▼
-                                                       ┌────────────────────────┐
-                                                       │ Optional Ryzen AI NPU  │
-                                                       │ via VitisAI provider   │
-                                                       └────────────────────────┘
+└────────────────────────┘
 ```
 
 This split keeps the hardware/runtime-specific pieces isolated while leaving the application workflow in Go.
 
-1. The Python Layer: ONNX and Ryzen AI Runtime
+1. The Python Layer: ONNX Runtime
 
-   The constraint: AMD's Ryzen AI software stack, the VitisAI Execution Provider, and the supporting runtime pieces are packaged primarily for Python/C++ workflows.
+   The constraint: model loading, image preprocessing, tokenization, and ONNX Runtime inference are Python-native concerns.
 
-   The solution: Instead of binding Go directly to native NPU/runtime libraries with cgo, the project isolates model loading and inference inside a small FastAPI service. That service uses `VitisAIExecutionProvider` when available and intentionally falls back to `CPUExecutionProvider` otherwise.
+   The solution: instead of binding Go directly to model-runtime libraries with cgo, the project isolates model loading and CPU inference inside a small FastAPI service.
 
-   Responsibilities: load the vision and text ONNX models, initialize ONNX Runtime with `vaip_config.json` when applicable, tokenize text, normalize both embedding types, and expose image and text embedding endpoints.
+   Responsibilities: load the vision and text ONNX models, tokenize text, normalize both embedding types, and expose image and text embedding endpoints.
 
 2. The Go Layer: Orchestration and Integration
 
@@ -416,7 +397,6 @@ This split keeps the hardware/runtime-specific pieces isolated while leaving the
 
 Key benefits:
 
-- Clean isolation: Ryzen AI, ONNX Runtime, and model-specific dependencies stay inside the Python environment instead of leaking into the Go process.
-- Practical fallback: the same API can run on CPU while the NPU provider/runtime is unavailable, which keeps development and testing unblocked.
+- Clean isolation: ONNX Runtime and model-specific dependencies stay inside the Python environment instead of leaking into the Go process.
+- Portable local inference: the embedding service runs on CPU without a hardware-specific runtime.
 - Clear data contract: Go sends image bytes as multipart form data and receives a normalized flat embedding vector suitable for cosine similarity.
-- Future acceleration path: when `VitisAIExecutionProvider` is correctly installed and detected, the Python service can use AMD's Ryzen AI runtime without changing the Go-side API.
