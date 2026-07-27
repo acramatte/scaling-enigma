@@ -1,0 +1,22 @@
+# Copy this file to benchmarks/video/manifest.yaml for local benchmark data.
+# Keep video binaries and the populated local manifest outside Git.
+# Phase 0 may use source_path. End-to-end S3 runs must additionally set
+# source_uri to the exact uploaded object version used by the run.
+
+schema_version: 1
+corpus_name: replace-with-a-local-corpus-name
+items:
+  - id: replace-with-stable-video-id
+    source_path: /absolute/path/to/example.mp4
+    source_uri: s3://semantic-search/incoming/example.mp4?versionId=replace-me
+    expected_media:
+      duration_ms: 0
+      width: 0
+      height: 0
+    queries:
+      - id: replace-with-stable-query-id
+        text: describe-the-visible-feature
+        relevant_intervals:
+          - start_ms: 0
+            end_ms: 0
+        notes: why-this-case-belongs-in-the-corpus

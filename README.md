@@ -44,6 +44,8 @@ their vectors can be compared in a shared space.
 
 For S3 notification setup, retry semantics, operational boundaries, and
 troubleshooting, see [`internal/storage/README.md`](internal/storage/README.md).
+The staged plan and benchmark protocol for video ingestion are in
+[`internal/ingestion/README.md`](internal/ingestion/README.md).
 
 ## PostgreSQL and pgvector
 
