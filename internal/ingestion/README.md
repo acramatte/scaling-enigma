@@ -59,7 +59,8 @@ S3 video upload
 - Video processing is bounded by object size, duration, frame count, temporary
   disk, decoder wall-clock time, worker count, and inference concurrency.
 - Long-running jobs use leases, heartbeats, expired-work recovery, and fencing.
-  A stale worker cannot publish or complete after another worker owns the job.
+  A stale worker cannot change queue state after another worker owns the job.
+  Video publication is separately fenced in its Phase 3 transaction.
 - A video index generation is published atomically. Search sees either the
   previous complete set or the new complete set, never partial or mixed frames.
 - Reindexing removes obsolete segments.
@@ -110,15 +111,28 @@ not replace the manually annotated retrieval-quality evaluation.
 
 ## Phase 1: queue hardening
 
+Phase 1a is implemented for the generic PostgreSQL queue:
+
+1. [`../../sql/migrations/00004_add_ingestion_job_leases.sql`](../../sql/migrations/00004_add_ingestion_job_leases.sql)
+   adds a lease token, expiry, heartbeat timestamp, lease-state invariant, and
+   expired-lease index. It safely returns any pre-lease `processing` row to
+   `pending` during rollout.
+2. A claim atomically assigns a random token, increments `attempts`, and can
+   reclaim an expired processing job. Heartbeat, retry, failure, and completion
+   all require the current unexpired token, so a stale worker cannot transition
+   the queue after reclamation.
+3. The worker heartbeats while processing and cancels work on lease loss. It
+   drains ready jobs without a ticker delay, polling only after an empty claim.
+
+The remaining Phase 1 work is:
+
 1. Classify jobs as image, video, or unsupported when they are enqueued, then
    verify the classification while processing.
-2. Drain ready jobs until the queue is empty; wait only while it is empty.
-3. Reserve independent image and video worker capacity so long videos do not
+2. Reserve independent image and video worker capacity so long videos do not
    cause image head-of-line blocking.
-4. Add lease token, expiry, heartbeat, expired-job reclaim, and fenced writes.
-5. Put the shared configurable inference semaphore in the Python service, which
+3. Put the shared configurable inference semaphore in the Python service, which
    owns the ONNX sessions and accelerator.
-6. Separate retryable transport/inference errors from permanent media and limit
+4. Separate retryable transport/inference errors from permanent media and limit
    failures.
 
 ## Phase 2: bounded video extraction

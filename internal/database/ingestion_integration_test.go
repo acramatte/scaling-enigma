@@ -51,7 +51,10 @@ func TestIngestionQueueIntegration(t *testing.T) {
 	if job.Attempts != 1 {
 		t.Fatalf("attempts = %d, want 1 after claim", job.Attempts)
 	}
-	if err := store.CompleteIngestionJob(ctx, job.ID, IngestionJobFailed, "test failure"); err != nil {
+	if job.LeaseToken == "" || job.LeaseExpiresAt == nil || job.HeartbeatAt == nil {
+		t.Fatalf("claimed job is missing lease state: %#v", job)
+	}
+	if err := store.CompleteIngestionJob(ctx, job.ID, job.LeaseToken, IngestionJobFailed, "test failure"); err != nil {
 		t.Fatalf("fail ingestion job: %v", err)
 	}
 	if err := store.RequeueFailedIngestionJob(ctx, job.ID); err != nil {
@@ -64,7 +67,7 @@ func TestIngestionQueueIntegration(t *testing.T) {
 	if retried == nil || retried.ID != job.ID || retried.Attempts != 1 {
 		t.Fatalf("requeued job = %#v, want original ID with fresh attempt count", retried)
 	}
-	if err := store.CompleteIngestionJob(ctx, retried.ID, IngestionJobCompleted, ""); err != nil {
+	if err := store.CompleteIngestionJob(ctx, retried.ID, retried.LeaseToken, IngestionJobCompleted, ""); err != nil {
 		t.Fatalf("complete requeued ingestion job: %v", err)
 	}
 	if err := store.RequeueFailedIngestionJob(ctx, retried.ID); err == nil {
@@ -86,7 +89,7 @@ func TestIngestionQueueIntegration(t *testing.T) {
 	if transient == nil {
 		t.Fatal("expected transient job")
 	}
-	if err := store.RetryIngestionJob(ctx, transient.ID, time.Now().Add(time.Hour), "temporary embedder failure"); err != nil {
+	if err := store.RetryIngestionJob(ctx, transient.ID, transient.LeaseToken, time.Now().Add(time.Hour), "temporary embedder failure"); err != nil {
 		t.Fatalf("retry transient job: %v", err)
 	}
 	unavailable, err := store.ClaimIngestionJob(ctx)
@@ -96,7 +99,7 @@ func TestIngestionQueueIntegration(t *testing.T) {
 	if unavailable != nil {
 		t.Fatalf("future retry was claimed early: %#v", unavailable)
 	}
-	if err := store.RetryIngestionJob(ctx, transient.ID, time.Now(), "not processing"); err == nil {
+	if err := store.RetryIngestionJob(ctx, transient.ID, transient.LeaseToken, time.Now(), "not processing"); err == nil {
 		t.Fatal("pending retry job was incorrectly retried again")
 	}
 	if _, err := store.pool.Exec(ctx, "UPDATE ingestion_jobs SET available_at = CURRENT_TIMESTAMP WHERE id = $1", transient.ID); err != nil {
@@ -115,7 +118,7 @@ func TestIngestionQueueIntegration(t *testing.T) {
 	if available.LastError != "temporary embedder failure" {
 		t.Fatalf("retry reason = %q, want persisted transient failure", available.LastError)
 	}
-	if err := store.CompleteIngestionJob(ctx, available.ID, IngestionJobCompleted, ""); err != nil {
+	if err := store.CompleteIngestionJob(ctx, available.ID, available.LeaseToken, IngestionJobCompleted, ""); err != nil {
 		t.Fatalf("complete available retry: %v", err)
 	}
 
@@ -154,7 +157,7 @@ func TestIngestionQueueIntegration(t *testing.T) {
 			t.Fatalf("job %d was claimed by two workers", result.job.ID)
 		}
 		claimedIDs[result.job.ID] = struct{}{}
-		if err := store.CompleteIngestionJob(ctx, result.job.ID, IngestionJobCompleted, ""); err != nil {
+		if err := store.CompleteIngestionJob(ctx, result.job.ID, result.job.LeaseToken, IngestionJobCompleted, ""); err != nil {
 			t.Fatalf("complete concurrently claimed job: %v", err)
 		}
 	}

@@ -18,11 +18,12 @@ import (
 )
 
 type Service struct {
-	db       *appdb.Store
-	store    *storage.Store
-	embedder *embedder.Client
-	token    string
-	enqueue  func(context.Context, appdb.EnqueueIngestionJobInput) (bool, error)
+	db          *appdb.Store
+	store       *storage.Store
+	embedder    *embedder.Client
+	token       string
+	enqueue     func(context.Context, appdb.EnqueueIngestionJobInput) (bool, error)
+	processNext func(context.Context) (bool, error)
 }
 
 const maxAttempts = 3
@@ -132,8 +133,12 @@ func (s *Service) Run(ctx context.Context, interval time.Duration) error {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
-		if err := s.ProcessNext(ctx); err != nil {
+		processed, err := s.ProcessNext(ctx)
+		if err != nil {
 			return err
+		}
+		if processed {
+			continue
 		}
 		select {
 		case <-ctx.Done():
@@ -143,18 +148,65 @@ func (s *Service) Run(ctx context.Context, interval time.Duration) error {
 	}
 }
 
-func (s *Service) ProcessNext(ctx context.Context) error {
+func (s *Service) ProcessNext(ctx context.Context) (bool, error) {
+	if s.processNext != nil {
+		return s.processNext(ctx)
+	}
 	job, err := s.db.ClaimIngestionJob(ctx)
 	if err != nil || job == nil {
-		return err
+		return false, err
 	}
+	return true, s.processClaimedWithLease(ctx, job)
+}
+
+func (s *Service) processClaimedWithLease(ctx context.Context, job *appdb.IngestionJob) error {
+	jobCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	heartbeatDone := make(chan struct{})
+	heartbeatErr := make(chan error, 1)
+	go func() {
+		defer close(heartbeatDone)
+		ticker := time.NewTicker(appdb.DefaultIngestionJobLeaseDuration / 3)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-jobCtx.Done():
+				return
+			case <-ticker.C:
+				if err := s.db.HeartbeatIngestionJob(jobCtx, job.ID, job.LeaseToken); err != nil {
+					select {
+					case heartbeatErr <- err:
+					default:
+					}
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+
+	status, reason, err := s.processClaimed(jobCtx, job)
+	cancel()
+	<-heartbeatDone
+	select {
+	case err := <-heartbeatErr:
+		return fmt.Errorf("heartbeat ingestion job %d: %w", job.ID, err)
+	default:
+	}
+	if err != nil {
+		return s.fail(ctx, job, err)
+	}
+	return s.db.CompleteIngestionJob(ctx, job.ID, job.LeaseToken, status, reason)
+}
+
+func (s *Service) processClaimed(ctx context.Context, job *appdb.IngestionJob) (string, string, error) {
 	if !isImage(job.ContentType, job.ObjectKey) {
-		return s.db.CompleteIngestionJob(ctx, job.ID, appdb.IngestionJobIgnored, "only image ingestion is implemented")
+		return appdb.IngestionJobIgnored, "only image ingestion is implemented", nil
 	}
 
 	object, err := s.store.Get(ctx, job.Bucket, job.ObjectKey, job.ObjectVersion)
 	if err != nil {
-		return s.fail(ctx, job, err)
+		return "", "", err
 	}
 	defer object.Body.Close()
 	contentType := job.ContentType
@@ -163,7 +215,7 @@ func (s *Service) ProcessNext(ctx context.Context) error {
 	}
 	embedding, err := s.embedder.GetImageEmbeddingContext(ctx, path.Base(job.ObjectKey), contentType, object.Body)
 	if err != nil {
-		return s.fail(ctx, job, fmt.Errorf("embed object: %w", err))
+		return "", "", fmt.Errorf("embed object: %w", err)
 	}
 
 	sourceURI := (&url.URL{Scheme: "s3", Host: job.Bucket, Path: "/" + job.ObjectKey}).String()
@@ -182,17 +234,17 @@ func (s *Service) ProcessNext(ctx context.Context) error {
 		EmbeddingMetadata: appdb.Metadata{"dimensions": len(embedding.Values)},
 		Values:            embedding.Values,
 	}); err != nil {
-		return s.fail(ctx, job, fmt.Errorf("save embedding: %w", err))
+		return "", "", fmt.Errorf("save embedding: %w", err)
 	}
-	return s.db.CompleteIngestionJob(ctx, job.ID, appdb.IngestionJobCompleted, "")
+	return appdb.IngestionJobCompleted, "", nil
 }
 
 func (s *Service) fail(ctx context.Context, job *appdb.IngestionJob, err error) error {
 	if job.Attempts >= maxAttempts {
-		return s.db.CompleteIngestionJob(ctx, job.ID, appdb.IngestionJobFailed, err.Error())
+		return s.db.CompleteIngestionJob(ctx, job.ID, job.LeaseToken, appdb.IngestionJobFailed, err.Error())
 	}
 	backoff := time.Duration(job.Attempts) * time.Second
-	return s.db.RetryIngestionJob(ctx, job.ID, time.Now().Add(backoff), err.Error())
+	return s.db.RetryIngestionJob(ctx, job.ID, job.LeaseToken, time.Now().Add(backoff), err.Error())
 }
 
 func isImage(contentType, objectKey string) bool {

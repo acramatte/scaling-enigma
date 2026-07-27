@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	appdb "semantic-search/internal/database"
 )
@@ -90,5 +91,38 @@ func TestIsImage(t *testing.T) {
 		if got := isImage(test.contentType, test.key); got != test.want {
 			t.Errorf("isImage(%q, %q) = %t, want %t", test.contentType, test.key, got, test.want)
 		}
+	}
+}
+
+func TestRunDrainsReadyJobsBeforePolling(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	calls := 0
+	service := &Service{
+		processNext: func(context.Context) (bool, error) {
+			calls++
+			if calls == 3 {
+				cancel()
+				return false, nil
+			}
+			return true, nil
+		},
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- service.Run(ctx, time.Hour)
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("run: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("worker waited for the poll interval instead of draining ready jobs")
+	}
+	if calls != 3 {
+		t.Fatalf("process calls = %d, want 3", calls)
 	}
 }

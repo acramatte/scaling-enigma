@@ -15,9 +15,9 @@ const claimIngestionJob = `-- name: ClaimIngestionJob :one
 WITH candidate AS (
     SELECT id
     FROM ingestion_jobs
-    WHERE status = 'pending'
-      AND available_at <= CURRENT_TIMESTAMP
-    ORDER BY available_at, id
+    WHERE (status = 'pending' AND available_at <= CURRENT_TIMESTAMP)
+       OR (status = 'processing' AND lease_expires_at <= CURRENT_TIMESTAMP)
+    ORDER BY CASE WHEN status = 'pending' THEN available_at ELSE lease_expires_at END, id
     FOR UPDATE SKIP LOCKED
     LIMIT 1
 )
@@ -25,21 +25,32 @@ UPDATE ingestion_jobs AS job
 SET status = 'processing',
     attempts = job.attempts + 1,
     started_at = CURRENT_TIMESTAMP,
+    lease_token = $1,
+    lease_expires_at = CURRENT_TIMESTAMP + ($2::BIGINT * INTERVAL '1 millisecond'),
+    heartbeat_at = CURRENT_TIMESTAMP,
     updated_at = CURRENT_TIMESTAMP
 FROM candidate
 WHERE job.id = candidate.id
-  AND job.status = 'pending'
-RETURNING job.id, job.bucket, job.object_key, job.object_version, job.etag, job.size_bytes, job.content_type, job.status, job.attempts, job.last_error, job.available_at, job.started_at, job.completed_at, job.created_at, job.updated_at
+  AND (
+      (job.status = 'pending' AND job.available_at <= CURRENT_TIMESTAMP)
+      OR (job.status = 'processing' AND job.lease_expires_at <= CURRENT_TIMESTAMP)
+  )
+RETURNING job.id, job.bucket, job.object_key, job.object_version, job.etag, job.size_bytes, job.content_type, job.status, job.attempts, job.last_error, job.available_at, job.started_at, job.completed_at, job.created_at, job.updated_at, job.lease_token, job.lease_expires_at, job.heartbeat_at
 `
+
+type ClaimIngestionJobParams struct {
+	LeaseToken                string
+	LeaseDurationMilliseconds int64
+}
 
 // ClaimIngestionJob
 //
 //	WITH candidate AS (
 //	    SELECT id
 //	    FROM ingestion_jobs
-//	    WHERE status = 'pending'
-//	      AND available_at <= CURRENT_TIMESTAMP
-//	    ORDER BY available_at, id
+//	    WHERE (status = 'pending' AND available_at <= CURRENT_TIMESTAMP)
+//	       OR (status = 'processing' AND lease_expires_at <= CURRENT_TIMESTAMP)
+//	    ORDER BY CASE WHEN status = 'pending' THEN available_at ELSE lease_expires_at END, id
 //	    FOR UPDATE SKIP LOCKED
 //	    LIMIT 1
 //	)
@@ -47,13 +58,19 @@ RETURNING job.id, job.bucket, job.object_key, job.object_version, job.etag, job.
 //	SET status = 'processing',
 //	    attempts = job.attempts + 1,
 //	    started_at = CURRENT_TIMESTAMP,
+//	    lease_token = $1,
+//	    lease_expires_at = CURRENT_TIMESTAMP + ($2::BIGINT * INTERVAL '1 millisecond'),
+//	    heartbeat_at = CURRENT_TIMESTAMP,
 //	    updated_at = CURRENT_TIMESTAMP
 //	FROM candidate
 //	WHERE job.id = candidate.id
-//	  AND job.status = 'pending'
-//	RETURNING job.id, job.bucket, job.object_key, job.object_version, job.etag, job.size_bytes, job.content_type, job.status, job.attempts, job.last_error, job.available_at, job.started_at, job.completed_at, job.created_at, job.updated_at
-func (q *Queries) ClaimIngestionJob(ctx context.Context) (IngestionJob, error) {
-	row := q.db.QueryRow(ctx, claimIngestionJob)
+//	  AND (
+//	      (job.status = 'pending' AND job.available_at <= CURRENT_TIMESTAMP)
+//	      OR (job.status = 'processing' AND job.lease_expires_at <= CURRENT_TIMESTAMP)
+//	  )
+//	RETURNING job.id, job.bucket, job.object_key, job.object_version, job.etag, job.size_bytes, job.content_type, job.status, job.attempts, job.last_error, job.available_at, job.started_at, job.completed_at, job.created_at, job.updated_at, job.lease_token, job.lease_expires_at, job.heartbeat_at
+func (q *Queries) ClaimIngestionJob(ctx context.Context, arg ClaimIngestionJobParams) (IngestionJob, error) {
+	row := q.db.QueryRow(ctx, claimIngestionJob, arg.LeaseToken, arg.LeaseDurationMilliseconds)
 	var i IngestionJob
 	err := row.Scan(
 		&i.ID,
@@ -71,6 +88,9 @@ func (q *Queries) ClaimIngestionJob(ctx context.Context) (IngestionJob, error) {
 		&i.CompletedAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.LeaseToken,
+		&i.LeaseExpiresAt,
+		&i.HeartbeatAt,
 	)
 	return i, err
 }
@@ -80,9 +100,14 @@ UPDATE ingestion_jobs
 SET status = $1,
     last_error = $2,
     completed_at = CURRENT_TIMESTAMP,
+    lease_token = '',
+    lease_expires_at = NULL,
+    heartbeat_at = NULL,
     updated_at = CURRENT_TIMESTAMP
 WHERE id = $3
   AND status = 'processing'
+  AND lease_token = $4
+  AND lease_expires_at > CURRENT_TIMESTAMP
 RETURNING id
 `
 
@@ -90,6 +115,7 @@ type CompleteIngestionJobParams struct {
 	TerminalStatus string
 	Reason         string
 	ID             int64
+	LeaseToken     string
 }
 
 // CompleteIngestionJob
@@ -98,12 +124,22 @@ type CompleteIngestionJobParams struct {
 //	SET status = $1,
 //	    last_error = $2,
 //	    completed_at = CURRENT_TIMESTAMP,
+//	    lease_token = '',
+//	    lease_expires_at = NULL,
+//	    heartbeat_at = NULL,
 //	    updated_at = CURRENT_TIMESTAMP
 //	WHERE id = $3
 //	  AND status = 'processing'
+//	  AND lease_token = $4
+//	  AND lease_expires_at > CURRENT_TIMESTAMP
 //	RETURNING id
 func (q *Queries) CompleteIngestionJob(ctx context.Context, arg CompleteIngestionJobParams) (int64, error) {
-	row := q.db.QueryRow(ctx, completeIngestionJob, arg.TerminalStatus, arg.Reason, arg.ID)
+	row := q.db.QueryRow(ctx, completeIngestionJob,
+		arg.TerminalStatus,
+		arg.Reason,
+		arg.ID,
+		arg.LeaseToken,
+	)
 	var id int64
 	err := row.Scan(&id)
 	return id, err
@@ -179,6 +215,42 @@ func (q *Queries) EnqueueIngestionJob(ctx context.Context, arg EnqueueIngestionJ
 	return inserted, err
 }
 
+const heartbeatIngestionJob = `-- name: HeartbeatIngestionJob :one
+UPDATE ingestion_jobs
+SET lease_expires_at = CURRENT_TIMESTAMP + ($1::BIGINT * INTERVAL '1 millisecond'),
+    heartbeat_at = CURRENT_TIMESTAMP,
+    updated_at = CURRENT_TIMESTAMP
+WHERE id = $2
+  AND status = 'processing'
+  AND lease_token = $3
+  AND lease_expires_at > CURRENT_TIMESTAMP
+RETURNING id
+`
+
+type HeartbeatIngestionJobParams struct {
+	LeaseDurationMilliseconds int64
+	ID                        int64
+	LeaseToken                string
+}
+
+// HeartbeatIngestionJob
+//
+//	UPDATE ingestion_jobs
+//	SET lease_expires_at = CURRENT_TIMESTAMP + ($1::BIGINT * INTERVAL '1 millisecond'),
+//	    heartbeat_at = CURRENT_TIMESTAMP,
+//	    updated_at = CURRENT_TIMESTAMP
+//	WHERE id = $2
+//	  AND status = 'processing'
+//	  AND lease_token = $3
+//	  AND lease_expires_at > CURRENT_TIMESTAMP
+//	RETURNING id
+func (q *Queries) HeartbeatIngestionJob(ctx context.Context, arg HeartbeatIngestionJobParams) (int64, error) {
+	row := q.db.QueryRow(ctx, heartbeatIngestionJob, arg.LeaseDurationMilliseconds, arg.ID, arg.LeaseToken)
+	var id int64
+	err := row.Scan(&id)
+	return id, err
+}
+
 const requeueFailedIngestionJob = `-- name: RequeueFailedIngestionJob :one
 UPDATE ingestion_jobs
 SET status = 'pending',
@@ -187,6 +259,9 @@ SET status = 'pending',
     available_at = CURRENT_TIMESTAMP,
     started_at = NULL,
     completed_at = NULL,
+    lease_token = '',
+    lease_expires_at = NULL,
+    heartbeat_at = NULL,
     updated_at = CURRENT_TIMESTAMP
 WHERE id = $1
   AND status = 'failed'
@@ -202,6 +277,9 @@ RETURNING id
 //	    available_at = CURRENT_TIMESTAMP,
 //	    started_at = NULL,
 //	    completed_at = NULL,
+//	    lease_token = '',
+//	    lease_expires_at = NULL,
+//	    heartbeat_at = NULL,
 //	    updated_at = CURRENT_TIMESTAMP
 //	WHERE id = $1
 //	  AND status = 'failed'
@@ -218,9 +296,14 @@ UPDATE ingestion_jobs
 SET status = 'pending',
     available_at = $1,
     last_error = $2,
+    lease_token = '',
+    lease_expires_at = NULL,
+    heartbeat_at = NULL,
     updated_at = CURRENT_TIMESTAMP
 WHERE id = $3
   AND status = 'processing'
+  AND lease_token = $4
+  AND lease_expires_at > CURRENT_TIMESTAMP
 RETURNING id
 `
 
@@ -228,6 +311,7 @@ type RetryIngestionJobParams struct {
 	AvailableAt pgtype.Timestamptz
 	Reason      string
 	ID          int64
+	LeaseToken  string
 }
 
 // RetryIngestionJob
@@ -236,12 +320,22 @@ type RetryIngestionJobParams struct {
 //	SET status = 'pending',
 //	    available_at = $1,
 //	    last_error = $2,
+//	    lease_token = '',
+//	    lease_expires_at = NULL,
+//	    heartbeat_at = NULL,
 //	    updated_at = CURRENT_TIMESTAMP
 //	WHERE id = $3
 //	  AND status = 'processing'
+//	  AND lease_token = $4
+//	  AND lease_expires_at > CURRENT_TIMESTAMP
 //	RETURNING id
 func (q *Queries) RetryIngestionJob(ctx context.Context, arg RetryIngestionJobParams) (int64, error) {
-	row := q.db.QueryRow(ctx, retryIngestionJob, arg.AvailableAt, arg.Reason, arg.ID)
+	row := q.db.QueryRow(ctx, retryIngestionJob,
+		arg.AvailableAt,
+		arg.Reason,
+		arg.ID,
+		arg.LeaseToken,
+	)
 	var id int64
 	err := row.Scan(&id)
 	return id, err

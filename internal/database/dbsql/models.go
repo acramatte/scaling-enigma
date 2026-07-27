@@ -33,19 +33,22 @@ type Embedding struct {
 }
 
 type IngestionJob struct {
-	ID            int64
-	Bucket        string
-	ObjectKey     string
-	ObjectVersion string
-	Etag          string
-	SizeBytes     *int64
-	ContentType   string
-	Status        string
-	Attempts      int32
-	LastError     string
-	AvailableAt   pgtype.Timestamptz
-	StartedAt     pgtype.Timestamptz
-	CompletedAt   pgtype.Timestamptz
-	CreatedAt     pgtype.Timestamptz
-	UpdatedAt     pgtype.Timestamptz
+	ID             int64
+	Bucket         string
+	ObjectKey      string
+	ObjectVersion  string
+	Etag           string
+	SizeBytes      *int64
+	ContentType    string
+	Status         string
+	Attempts       int32
+	LastError      string
+	AvailableAt    pgtype.Timestamptz
+	StartedAt      pgtype.Timestamptz
+	CompletedAt    pgtype.Timestamptz
+	CreatedAt      pgtype.Timestamptz
+	UpdatedAt      pgtype.Timestamptz
+	LeaseToken     string
+	LeaseExpiresAt pgtype.Timestamptz
+	HeartbeatAt    pgtype.Timestamptz
 }
