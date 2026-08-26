@@ -229,7 +229,10 @@ func (s *server) serveS3Image(w http.ResponseWriter, r *http.Request, parsed *ur
 }
 
 func contentTypeForImage(name, contentType string) string {
-	contentType = strings.TrimSpace(strings.Split(contentType, ";")[0])
+	if before, _, found := strings.CutLast(contentType, ";"); found {
+		contentType = before
+	}
+	contentType = strings.TrimSpace(contentType)
 	if contentType != "" && contentType != "application/octet-stream" {
 		return contentType
 	}

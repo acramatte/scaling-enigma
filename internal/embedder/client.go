@@ -3,7 +3,7 @@ package embedder
 import (
 	"bytes"
 	"context"
-	"encoding/json"
+	"encoding/json/v2"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -115,7 +115,7 @@ func (c *Client) do(req *http.Request) (Result, error) {
 	}
 
 	var response embeddingResponse
-	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
+	if err := json.UnmarshalRead(resp.Body, &response); err != nil {
 		return Result{}, fmt.Errorf("failed parsing embedding array: %w", err)
 	}
 
