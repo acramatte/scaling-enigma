@@ -2,7 +2,7 @@ package ingestion
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/v2"
 	"fmt"
 	"log"
 	"mime"
@@ -78,8 +78,8 @@ func (s *Service) HandleEvent(w http.ResponseWriter, r *http.Request) {
 
 	defer r.Body.Close()
 	var notification eventNotification
-	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
-	if err := decoder.Decode(&notification); err != nil {
+	limited := http.MaxBytesReader(w, r.Body, 1<<20)
+	if err := json.UnmarshalRead(limited, &notification); err != nil {
 		log.Printf("S3 webhook request rejected remote=%q reason=invalid_notification error=%q", r.RemoteAddr, err)
 		http.Error(w, "invalid S3 event notification", http.StatusBadRequest)
 		return
