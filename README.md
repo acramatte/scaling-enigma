@@ -66,9 +66,10 @@ Open a `psql` shell inside the container:
 make db-psql
 ```
 
-The Go application uses GORM and reads `DATABASE_URL`. When it is unset, it
-defaults to the credentials in `compose.yaml`. Copy `.env.example` if you want
-to customize the Compose or application settings:
+The Go application uses `pgx` with `sqlc`-generated queries and reads
+`DATABASE_URL`. When it is unset, it defaults to the credentials in
+`compose.yaml`. Copy `.env.example` if you want to customize the Compose or
+application settings:
 
 ```bash
 cp .env.example .env
