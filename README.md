@@ -148,11 +148,15 @@ event-loop thread. Keep blocking `InferenceSession.run` calls outside the event
 loop so concurrent health and API requests remain responsive. The synchronous
 text endpoint is likewise offloaded by FastAPI automatically.
 
-There is not yet an explicit inference-concurrency limit. That limit should live
-in the embedding service—the owner of the ONNX sessions and hardware—so it also
-protects direct CLI, web, and future callers. The ingestion worker can
-additionally limit job concurrency for backpressure, but it must not be the only
-hardware guard.
+The embedding service enforces a shared inference-concurrency limit across both
+`/embed/image` and `/embed/text` using `INFERENCE_MAX_CONCURRENCY` (default `1`)
+and `INFERENCE_ACQUIRE_TIMEOUT_SECONDS` (default `30`). Keeping this semaphore
+in the Python service—the owner of the ONNX sessions and hardware—protects
+direct CLI, web, and ingestion callers alike, returning HTTP `503` if all slots
+remain saturated past the timeout while keeping `/health` responsive. The Go
+ingester separately reserves independent image and video worker capacity
+(`INGESTION_IMAGE_WORKERS`, `INGESTION_VIDEO_WORKERS`) and enforces
+`INGESTION_MAX_IMAGE_BYTES` (default 32 MiB).
 
 ## Install and test the text encoder
 

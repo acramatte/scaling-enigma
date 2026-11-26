@@ -6,7 +6,11 @@ WITH inserted AS (
         object_version,
         etag,
         size_bytes,
-        content_type
+        content_type,
+        media_class,
+        status,
+        last_error,
+        completed_at
     )
     VALUES (
         sqlc.arg(bucket),
@@ -14,18 +18,28 @@ WITH inserted AS (
         sqlc.arg(object_version),
         sqlc.arg(etag),
         sqlc.narg(size_bytes),
-        sqlc.arg(content_type)
+        sqlc.arg(content_type),
+        sqlc.arg(media_class),
+        CASE WHEN sqlc.arg(media_class)::TEXT = 'unsupported' THEN 'ignored' ELSE 'pending' END,
+        CASE WHEN sqlc.arg(media_class)::TEXT = 'unsupported' THEN 'unsupported media type' ELSE '' END,
+        CASE WHEN sqlc.arg(media_class)::TEXT = 'unsupported' THEN CURRENT_TIMESTAMP ELSE NULL END
     )
     ON CONFLICT (bucket, object_key, object_version, etag) DO NOTHING
     RETURNING id
 )
 SELECT EXISTS (SELECT 1 FROM inserted) AS inserted;
 
+-- name: GetIngestionJob :one
+SELECT *
+FROM ingestion_jobs
+WHERE id = sqlc.arg(id);
+
 -- name: RequeueFailedIngestionJob :one
 UPDATE ingestion_jobs
 SET status = 'pending',
     attempts = 0,
     last_error = '',
+    failure_kind = '',
     available_at = CURRENT_TIMESTAMP,
     started_at = NULL,
     completed_at = NULL,
@@ -35,6 +49,7 @@ SET status = 'pending',
     updated_at = CURRENT_TIMESTAMP
 WHERE id = sqlc.arg(id)
   AND status = 'failed'
+  AND media_class <> 'unsupported'
 RETURNING id;
 
 -- name: ClaimIngestionJob :one
@@ -63,10 +78,41 @@ WHERE job.id = candidate.id
   )
 RETURNING job.*;
 
+-- name: ClaimIngestionJobByClass :one
+WITH candidate AS (
+    SELECT id
+    FROM ingestion_jobs
+    WHERE media_class = sqlc.arg(media_class)
+      AND (
+          (status = 'pending' AND available_at <= CURRENT_TIMESTAMP)
+          OR (status = 'processing' AND lease_expires_at <= CURRENT_TIMESTAMP)
+      )
+    ORDER BY CASE WHEN status = 'pending' THEN available_at ELSE lease_expires_at END, id
+    FOR UPDATE SKIP LOCKED
+    LIMIT 1
+)
+UPDATE ingestion_jobs AS job
+SET status = 'processing',
+    attempts = job.attempts + 1,
+    started_at = CURRENT_TIMESTAMP,
+    lease_token = sqlc.arg(lease_token),
+    lease_expires_at = CURRENT_TIMESTAMP + (sqlc.arg(lease_duration_milliseconds)::BIGINT * INTERVAL '1 millisecond'),
+    heartbeat_at = CURRENT_TIMESTAMP,
+    updated_at = CURRENT_TIMESTAMP
+FROM candidate
+WHERE job.id = candidate.id
+  AND job.media_class = sqlc.arg(media_class)
+  AND (
+      (job.status = 'pending' AND job.available_at <= CURRENT_TIMESTAMP)
+      OR (job.status = 'processing' AND job.lease_expires_at <= CURRENT_TIMESTAMP)
+  )
+RETURNING job.*;
+
 -- name: CompleteIngestionJob :one
 UPDATE ingestion_jobs
 SET status = sqlc.arg(terminal_status),
     last_error = sqlc.arg(reason),
+    failure_kind = CASE WHEN sqlc.arg(terminal_status)::TEXT = 'failed' THEN sqlc.arg(failure_kind)::TEXT ELSE '' END,
     completed_at = CURRENT_TIMESTAMP,
     lease_token = '',
     lease_expires_at = NULL,
@@ -83,6 +129,7 @@ UPDATE ingestion_jobs
 SET status = 'pending',
     available_at = sqlc.arg(available_at),
     last_error = sqlc.arg(reason),
+    failure_kind = 'retryable',
     lease_token = '',
     lease_expires_at = NULL,
     heartbeat_at = NULL,

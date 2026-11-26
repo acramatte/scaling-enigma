@@ -432,16 +432,16 @@ they can remove unrelated project data.
 - The current local webhook path uses Linux host networking. If the ingester
   moves into Compose, put both services on the same Compose network and use the
   ingester service name instead.
-- Claimed jobs do not yet have a processing lease. If the ingester process exits
-  after a job changes to `processing`, that job must be inspected and recovered
-  deliberately rather than being reclaimed automatically.
-- Image objects are currently buffered in memory before being sent to the
-  embedder, without a configured maximum object size. The worker also does not
-  yet use the event ETag as an `If-Match` precondition when fetching an
-  unversioned object. Add both safeguards before accepting untrusted or
-  high-volume uploads.
-- Video ingestion is not implemented yet. It is expected to extract frames and
-  produce segment-aware embeddings in a later change.
+- Claimed jobs use processing leases with heartbeats and expired-lease
+  reclamation (`00004_add_ingestion_job_leases.sql`), plus class-scoped worker
+  isolation and failure classification (`00005_add_ingestion_job_classification.sql`).
+- Image downloads are bounded by `INGESTION_MAX_IMAGE_BYTES` (default 32 MiB)
+  and verified against storage content type and magic bytes before inference.
+  The worker does not yet send the event ETag as an `If-Match` precondition when
+  fetching an unversioned object.
+- Video ingestion is not implemented yet. Video uploads are classified as
+  `video` at enqueue time, claimed by the dedicated video worker pool, and
+  marked `ignored` until Phase 2 adds bounded frame extraction.
 - Local HTTP endpoints and development credentials are not production security
   settings. Production deployment requires appropriate TLS, secret management,
   network policy, and S3 permissions.
