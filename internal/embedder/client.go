@@ -24,6 +24,16 @@ type Result struct {
 	Model  string
 }
 
+// StatusError reports a non-200 HTTP response from the embedding service.
+type StatusError struct {
+	StatusCode int
+	Body       string
+}
+
+func (e *StatusError) Error() string {
+	return fmt.Sprintf("embedding service returned error (%d): %s", e.StatusCode, e.Body)
+}
+
 // Client wraps the FastAPI embedding service connection.
 type Client struct {
 	endpoint string
@@ -110,8 +120,11 @@ func (c *Client) do(req *http.Request) (Result, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
-		return Result{}, fmt.Errorf("embedding service returned error (%d): %s", resp.StatusCode, string(respBody))
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+		return Result{}, &StatusError{
+			StatusCode: resp.StatusCode,
+			Body:       strings.TrimSpace(string(respBody)),
+		}
 	}
 
 	var response embeddingResponse

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -48,7 +49,26 @@ func main() {
 	if embedderURL == "" {
 		embedderURL = defaultEmbedderURL
 	}
-	service := ingestion.New(db, store, embedder.NewClient(embedderURL), os.Getenv("INGESTION_WEBHOOK_TOKEN"))
+	imageWorkers, err := envPositiveInt("INGESTION_IMAGE_WORKERS", ingestion.DefaultImageWorkers)
+	if err != nil {
+		log.Fatalf("configuration failed: %v", err)
+	}
+	videoWorkers, err := envPositiveInt("INGESTION_VIDEO_WORKERS", ingestion.DefaultVideoWorkers)
+	if err != nil {
+		log.Fatalf("configuration failed: %v", err)
+	}
+	maxImageBytes, err := envPositiveInt64("INGESTION_MAX_IMAGE_BYTES", ingestion.DefaultMaxImageBytes)
+	if err != nil {
+		log.Fatalf("configuration failed: %v", err)
+	}
+
+	service := ingestion.NewWithConfig(db, store, embedder.NewClient(embedderURL), ingestion.Config{
+		WebhookToken:  os.Getenv("INGESTION_WEBHOOK_TOKEN"),
+		ImageWorkers:  imageWorkers,
+		VideoWorkers:  videoWorkers,
+		MaxImageBytes: maxImageBytes,
+	})
+	log.Printf("ingestion workers configured image_workers=%d video_workers=%d max_image_bytes=%d", imageWorkers, videoWorkers, maxImageBytes)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("HEAD /{$}", func(w http.ResponseWriter, _ *http.Request) {
@@ -84,4 +104,28 @@ func main() {
 			log.Fatal(fmt.Errorf("ingestion service: %w", err))
 		}
 	}
+}
+
+func envPositiveInt(name string, defaultValue int) (int, error) {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return defaultValue, nil
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil || value <= 0 {
+		return 0, fmt.Errorf("%s must be a positive integer, got %q", name, raw)
+	}
+	return value, nil
+}
+
+func envPositiveInt64(name string, defaultValue int64) (int64, error) {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return defaultValue, nil
+	}
+	value, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || value <= 0 {
+		return 0, fmt.Errorf("%s must be a positive integer, got %q", name, raw)
+	}
+	return value, nil
 }

@@ -51,4 +51,6 @@ type IngestionJob struct {
 	LeaseToken     string
 	LeaseExpiresAt pgtype.Timestamptz
 	HeartbeatAt    pgtype.Timestamptz
+	MediaClass     string
+	FailureKind    string
 }

@@ -35,7 +35,7 @@ WHERE job.id = candidate.id
       (job.status = 'pending' AND job.available_at <= CURRENT_TIMESTAMP)
       OR (job.status = 'processing' AND job.lease_expires_at <= CURRENT_TIMESTAMP)
   )
-RETURNING job.id, job.bucket, job.object_key, job.object_version, job.etag, job.size_bytes, job.content_type, job.status, job.attempts, job.last_error, job.available_at, job.started_at, job.completed_at, job.created_at, job.updated_at, job.lease_token, job.lease_expires_at, job.heartbeat_at
+RETURNING job.id, job.bucket, job.object_key, job.object_version, job.etag, job.size_bytes, job.content_type, job.status, job.attempts, job.last_error, job.available_at, job.started_at, job.completed_at, job.created_at, job.updated_at, job.lease_token, job.lease_expires_at, job.heartbeat_at, job.media_class, job.failure_kind
 `
 
 type ClaimIngestionJobParams struct {
@@ -68,7 +68,7 @@ type ClaimIngestionJobParams struct {
 //	      (job.status = 'pending' AND job.available_at <= CURRENT_TIMESTAMP)
 //	      OR (job.status = 'processing' AND job.lease_expires_at <= CURRENT_TIMESTAMP)
 //	  )
-//	RETURNING job.id, job.bucket, job.object_key, job.object_version, job.etag, job.size_bytes, job.content_type, job.status, job.attempts, job.last_error, job.available_at, job.started_at, job.completed_at, job.created_at, job.updated_at, job.lease_token, job.lease_expires_at, job.heartbeat_at
+//	RETURNING job.id, job.bucket, job.object_key, job.object_version, job.etag, job.size_bytes, job.content_type, job.status, job.attempts, job.last_error, job.available_at, job.started_at, job.completed_at, job.created_at, job.updated_at, job.lease_token, job.lease_expires_at, job.heartbeat_at, job.media_class, job.failure_kind
 func (q *Queries) ClaimIngestionJob(ctx context.Context, arg ClaimIngestionJobParams) (IngestionJob, error) {
 	row := q.db.QueryRow(ctx, claimIngestionJob, arg.LeaseToken, arg.LeaseDurationMilliseconds)
 	var i IngestionJob
@@ -91,6 +91,103 @@ func (q *Queries) ClaimIngestionJob(ctx context.Context, arg ClaimIngestionJobPa
 		&i.LeaseToken,
 		&i.LeaseExpiresAt,
 		&i.HeartbeatAt,
+		&i.MediaClass,
+		&i.FailureKind,
+	)
+	return i, err
+}
+
+const claimIngestionJobByClass = `-- name: ClaimIngestionJobByClass :one
+WITH candidate AS (
+    SELECT id
+    FROM ingestion_jobs
+    WHERE media_class = $3
+      AND (
+          (status = 'pending' AND available_at <= CURRENT_TIMESTAMP)
+          OR (status = 'processing' AND lease_expires_at <= CURRENT_TIMESTAMP)
+      )
+    ORDER BY CASE WHEN status = 'pending' THEN available_at ELSE lease_expires_at END, id
+    FOR UPDATE SKIP LOCKED
+    LIMIT 1
+)
+UPDATE ingestion_jobs AS job
+SET status = 'processing',
+    attempts = job.attempts + 1,
+    started_at = CURRENT_TIMESTAMP,
+    lease_token = $1,
+    lease_expires_at = CURRENT_TIMESTAMP + ($2::BIGINT * INTERVAL '1 millisecond'),
+    heartbeat_at = CURRENT_TIMESTAMP,
+    updated_at = CURRENT_TIMESTAMP
+FROM candidate
+WHERE job.id = candidate.id
+  AND job.media_class = $3
+  AND (
+      (job.status = 'pending' AND job.available_at <= CURRENT_TIMESTAMP)
+      OR (job.status = 'processing' AND job.lease_expires_at <= CURRENT_TIMESTAMP)
+  )
+RETURNING job.id, job.bucket, job.object_key, job.object_version, job.etag, job.size_bytes, job.content_type, job.status, job.attempts, job.last_error, job.available_at, job.started_at, job.completed_at, job.created_at, job.updated_at, job.lease_token, job.lease_expires_at, job.heartbeat_at, job.media_class, job.failure_kind
+`
+
+type ClaimIngestionJobByClassParams struct {
+	LeaseToken                string
+	LeaseDurationMilliseconds int64
+	MediaClass                string
+}
+
+// ClaimIngestionJobByClass
+//
+//	WITH candidate AS (
+//	    SELECT id
+//	    FROM ingestion_jobs
+//	    WHERE media_class = $3
+//	      AND (
+//	          (status = 'pending' AND available_at <= CURRENT_TIMESTAMP)
+//	          OR (status = 'processing' AND lease_expires_at <= CURRENT_TIMESTAMP)
+//	      )
+//	    ORDER BY CASE WHEN status = 'pending' THEN available_at ELSE lease_expires_at END, id
+//	    FOR UPDATE SKIP LOCKED
+//	    LIMIT 1
+//	)
+//	UPDATE ingestion_jobs AS job
+//	SET status = 'processing',
+//	    attempts = job.attempts + 1,
+//	    started_at = CURRENT_TIMESTAMP,
+//	    lease_token = $1,
+//	    lease_expires_at = CURRENT_TIMESTAMP + ($2::BIGINT * INTERVAL '1 millisecond'),
+//	    heartbeat_at = CURRENT_TIMESTAMP,
+//	    updated_at = CURRENT_TIMESTAMP
+//	FROM candidate
+//	WHERE job.id = candidate.id
+//	  AND job.media_class = $3
+//	  AND (
+//	      (job.status = 'pending' AND job.available_at <= CURRENT_TIMESTAMP)
+//	      OR (job.status = 'processing' AND job.lease_expires_at <= CURRENT_TIMESTAMP)
+//	  )
+//	RETURNING job.id, job.bucket, job.object_key, job.object_version, job.etag, job.size_bytes, job.content_type, job.status, job.attempts, job.last_error, job.available_at, job.started_at, job.completed_at, job.created_at, job.updated_at, job.lease_token, job.lease_expires_at, job.heartbeat_at, job.media_class, job.failure_kind
+func (q *Queries) ClaimIngestionJobByClass(ctx context.Context, arg ClaimIngestionJobByClassParams) (IngestionJob, error) {
+	row := q.db.QueryRow(ctx, claimIngestionJobByClass, arg.LeaseToken, arg.LeaseDurationMilliseconds, arg.MediaClass)
+	var i IngestionJob
+	err := row.Scan(
+		&i.ID,
+		&i.Bucket,
+		&i.ObjectKey,
+		&i.ObjectVersion,
+		&i.Etag,
+		&i.SizeBytes,
+		&i.ContentType,
+		&i.Status,
+		&i.Attempts,
+		&i.LastError,
+		&i.AvailableAt,
+		&i.StartedAt,
+		&i.CompletedAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.LeaseToken,
+		&i.LeaseExpiresAt,
+		&i.HeartbeatAt,
+		&i.MediaClass,
+		&i.FailureKind,
 	)
 	return i, err
 }
@@ -99,14 +196,15 @@ const completeIngestionJob = `-- name: CompleteIngestionJob :one
 UPDATE ingestion_jobs
 SET status = $1,
     last_error = $2,
+    failure_kind = CASE WHEN $1::TEXT = 'failed' THEN $3::TEXT ELSE '' END,
     completed_at = CURRENT_TIMESTAMP,
     lease_token = '',
     lease_expires_at = NULL,
     heartbeat_at = NULL,
     updated_at = CURRENT_TIMESTAMP
-WHERE id = $3
+WHERE id = $4
   AND status = 'processing'
-  AND lease_token = $4
+  AND lease_token = $5
   AND lease_expires_at > CURRENT_TIMESTAMP
 RETURNING id
 `
@@ -114,6 +212,7 @@ RETURNING id
 type CompleteIngestionJobParams struct {
 	TerminalStatus string
 	Reason         string
+	FailureKind    string
 	ID             int64
 	LeaseToken     string
 }
@@ -123,20 +222,22 @@ type CompleteIngestionJobParams struct {
 //	UPDATE ingestion_jobs
 //	SET status = $1,
 //	    last_error = $2,
+//	    failure_kind = CASE WHEN $1::TEXT = 'failed' THEN $3::TEXT ELSE '' END,
 //	    completed_at = CURRENT_TIMESTAMP,
 //	    lease_token = '',
 //	    lease_expires_at = NULL,
 //	    heartbeat_at = NULL,
 //	    updated_at = CURRENT_TIMESTAMP
-//	WHERE id = $3
+//	WHERE id = $4
 //	  AND status = 'processing'
-//	  AND lease_token = $4
+//	  AND lease_token = $5
 //	  AND lease_expires_at > CURRENT_TIMESTAMP
 //	RETURNING id
 func (q *Queries) CompleteIngestionJob(ctx context.Context, arg CompleteIngestionJobParams) (int64, error) {
 	row := q.db.QueryRow(ctx, completeIngestionJob,
 		arg.TerminalStatus,
 		arg.Reason,
+		arg.FailureKind,
 		arg.ID,
 		arg.LeaseToken,
 	)
@@ -153,7 +254,11 @@ WITH inserted AS (
         object_version,
         etag,
         size_bytes,
-        content_type
+        content_type,
+        media_class,
+        status,
+        last_error,
+        completed_at
     )
     VALUES (
         $1,
@@ -161,7 +266,11 @@ WITH inserted AS (
         $3,
         $4,
         $5,
-        $6
+        $6,
+        $7,
+        CASE WHEN $7::TEXT = 'unsupported' THEN 'ignored' ELSE 'pending' END,
+        CASE WHEN $7::TEXT = 'unsupported' THEN 'unsupported media type' ELSE '' END,
+        CASE WHEN $7::TEXT = 'unsupported' THEN CURRENT_TIMESTAMP ELSE NULL END
     )
     ON CONFLICT (bucket, object_key, object_version, etag) DO NOTHING
     RETURNING id
@@ -176,6 +285,7 @@ type EnqueueIngestionJobParams struct {
 	Etag          string
 	SizeBytes     *int64
 	ContentType   string
+	MediaClass    string
 }
 
 // EnqueueIngestionJob
@@ -187,7 +297,11 @@ type EnqueueIngestionJobParams struct {
 //	        object_version,
 //	        etag,
 //	        size_bytes,
-//	        content_type
+//	        content_type,
+//	        media_class,
+//	        status,
+//	        last_error,
+//	        completed_at
 //	    )
 //	    VALUES (
 //	        $1,
@@ -195,7 +309,11 @@ type EnqueueIngestionJobParams struct {
 //	        $3,
 //	        $4,
 //	        $5,
-//	        $6
+//	        $6,
+//	        $7,
+//	        CASE WHEN $7::TEXT = 'unsupported' THEN 'ignored' ELSE 'pending' END,
+//	        CASE WHEN $7::TEXT = 'unsupported' THEN 'unsupported media type' ELSE '' END,
+//	        CASE WHEN $7::TEXT = 'unsupported' THEN CURRENT_TIMESTAMP ELSE NULL END
 //	    )
 //	    ON CONFLICT (bucket, object_key, object_version, etag) DO NOTHING
 //	    RETURNING id
@@ -209,10 +327,50 @@ func (q *Queries) EnqueueIngestionJob(ctx context.Context, arg EnqueueIngestionJ
 		arg.Etag,
 		arg.SizeBytes,
 		arg.ContentType,
+		arg.MediaClass,
 	)
 	var inserted bool
 	err := row.Scan(&inserted)
 	return inserted, err
+}
+
+const getIngestionJob = `-- name: GetIngestionJob :one
+SELECT id, bucket, object_key, object_version, etag, size_bytes, content_type, status, attempts, last_error, available_at, started_at, completed_at, created_at, updated_at, lease_token, lease_expires_at, heartbeat_at, media_class, failure_kind
+FROM ingestion_jobs
+WHERE id = $1
+`
+
+// GetIngestionJob
+//
+//	SELECT id, bucket, object_key, object_version, etag, size_bytes, content_type, status, attempts, last_error, available_at, started_at, completed_at, created_at, updated_at, lease_token, lease_expires_at, heartbeat_at, media_class, failure_kind
+//	FROM ingestion_jobs
+//	WHERE id = $1
+func (q *Queries) GetIngestionJob(ctx context.Context, id int64) (IngestionJob, error) {
+	row := q.db.QueryRow(ctx, getIngestionJob, id)
+	var i IngestionJob
+	err := row.Scan(
+		&i.ID,
+		&i.Bucket,
+		&i.ObjectKey,
+		&i.ObjectVersion,
+		&i.Etag,
+		&i.SizeBytes,
+		&i.ContentType,
+		&i.Status,
+		&i.Attempts,
+		&i.LastError,
+		&i.AvailableAt,
+		&i.StartedAt,
+		&i.CompletedAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.LeaseToken,
+		&i.LeaseExpiresAt,
+		&i.HeartbeatAt,
+		&i.MediaClass,
+		&i.FailureKind,
+	)
+	return i, err
 }
 
 const heartbeatIngestionJob = `-- name: HeartbeatIngestionJob :one
@@ -256,6 +414,7 @@ UPDATE ingestion_jobs
 SET status = 'pending',
     attempts = 0,
     last_error = '',
+    failure_kind = '',
     available_at = CURRENT_TIMESTAMP,
     started_at = NULL,
     completed_at = NULL,
@@ -265,6 +424,7 @@ SET status = 'pending',
     updated_at = CURRENT_TIMESTAMP
 WHERE id = $1
   AND status = 'failed'
+  AND media_class <> 'unsupported'
 RETURNING id
 `
 
@@ -274,6 +434,7 @@ RETURNING id
 //	SET status = 'pending',
 //	    attempts = 0,
 //	    last_error = '',
+//	    failure_kind = '',
 //	    available_at = CURRENT_TIMESTAMP,
 //	    started_at = NULL,
 //	    completed_at = NULL,
@@ -283,6 +444,7 @@ RETURNING id
 //	    updated_at = CURRENT_TIMESTAMP
 //	WHERE id = $1
 //	  AND status = 'failed'
+//	  AND media_class <> 'unsupported'
 //	RETURNING id
 func (q *Queries) RequeueFailedIngestionJob(ctx context.Context, id int64) (int64, error) {
 	row := q.db.QueryRow(ctx, requeueFailedIngestionJob, id)
@@ -296,6 +458,7 @@ UPDATE ingestion_jobs
 SET status = 'pending',
     available_at = $1,
     last_error = $2,
+    failure_kind = 'retryable',
     lease_token = '',
     lease_expires_at = NULL,
     heartbeat_at = NULL,
@@ -320,6 +483,7 @@ type RetryIngestionJobParams struct {
 //	SET status = 'pending',
 //	    available_at = $1,
 //	    last_error = $2,
+//	    failure_kind = 'retryable',
 //	    lease_token = '',
 //	    lease_expires_at = NULL,
 //	    heartbeat_at = NULL,

@@ -19,6 +19,19 @@ const (
 	IngestionJobFailed     = "failed"
 )
 
+const (
+	IngestionMediaClassImage       = "image"
+	IngestionMediaClassVideo       = "video"
+	IngestionMediaClassUnsupported = "unsupported"
+)
+
+const (
+	IngestionFailureNone           = ""
+	IngestionFailureRetryable      = "retryable"
+	IngestionFailurePermanentMedia = "permanent_media"
+	IngestionFailurePermanentLimit = "permanent_limit"
+)
+
 type Metadata map[string]any
 
 // IngestionJob is the domain representation of a single object version that
@@ -32,9 +45,11 @@ type IngestionJob struct {
 	ETag           string
 	SizeBytes      *int64
 	ContentType    string
+	MediaClass     string
 	Status         string
 	Attempts       int
 	LastError      string
+	FailureKind    string
 	AvailableAt    time.Time
 	StartedAt      *time.Time
 	CompletedAt    *time.Time

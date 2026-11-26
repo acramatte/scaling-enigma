@@ -111,29 +111,42 @@ not replace the manually annotated retrieval-quality evaluation.
 
 ## Phase 1: queue hardening
 
-Phase 1a is implemented for the generic PostgreSQL queue:
+Phase 1 is implemented:
 
-1. [`../../sql/migrations/00004_add_ingestion_job_leases.sql`](../../sql/migrations/00004_add_ingestion_job_leases.sql)
+1. **Leases and fencing (Phase 1a):**
+   [`../../sql/migrations/00004_add_ingestion_job_leases.sql`](../../sql/migrations/00004_add_ingestion_job_leases.sql)
    adds a lease token, expiry, heartbeat timestamp, lease-state invariant, and
    expired-lease index. It safely returns any pre-lease `processing` row to
-   `pending` during rollout.
-2. A claim atomically assigns a random token, increments `attempts`, and can
-   reclaim an expired processing job. Heartbeat, retry, failure, and completion
-   all require the current unexpired token, so a stale worker cannot transition
-   the queue after reclamation.
-3. The worker heartbeats while processing and cancels work on lease loss. It
-   drains ready jobs without a ticker delay, polling only after an empty claim.
-
-The remaining Phase 1 work is:
-
-1. Classify jobs as image, video, or unsupported when they are enqueued, then
-   verify the classification while processing.
-2. Reserve independent image and video worker capacity so long videos do not
-   cause image head-of-line blocking.
-3. Put the shared configurable inference semaphore in the Python service, which
-   owns the ONNX sessions and accelerator.
-4. Separate retryable transport/inference errors from permanent media and limit
-   failures.
+   `pending` during rollout. Claims atomically assign a random token, increment
+   `attempts`, and reclaim expired jobs. Heartbeat, retry, failure, and
+   completion all require the current unexpired token, and workers heartbeat
+   while processing and cancel work on lease loss.
+2. **Enqueue classification and processing verification (Phase 1b):**
+   [`../../sql/migrations/00005_add_ingestion_job_classification.sql`](../../sql/migrations/00005_add_ingestion_job_classification.sql)
+   adds `media_class` (`image`, `video`, `unsupported`), `failure_kind`
+   (`''`, `retryable`, `permanent_media`, `permanent_limit`), DB check
+   constraints, and class-scoped partial indexes. Jobs are classified from event
+   metadata when enqueued (marking `unsupported` uploads `ignored` immediately),
+   and downloaded image payloads are verified against S3 content type and magic
+   bytes before inference.
+3. **Independent image and video worker capacity (Phase 1b):**
+   `cmd/ingester` runs separate image and video worker pools
+   (`INGESTION_IMAGE_WORKERS`, `INGESTION_VIDEO_WORKERS`, default `1` each)
+   claiming class-scoped slices (`ClaimIngestionJobByClass`) so long video jobs
+   cannot head-of-line block image ingestion.
+4. **Shared Python inference semaphore (Phase 1b):**
+   [`../../embed_service.py`](../../embed_service.py) guards both `/embed/image`
+   and `/embed/text` with a shared configurable `asyncio.Semaphore`
+   (`INFERENCE_MAX_CONCURRENCY`, default `1`; `INFERENCE_ACQUIRE_TIMEOUT_SECONDS`,
+   default `30`), returning HTTP `503` on saturation timeout while keeping
+   `/health` responsive.
+5. **Retryable vs. permanent failure separation (Phase 1b):**
+   Transport, timeout, `429`/`5xx` embedder/S3 errors, and database errors
+   schedule retries up to three attempts (`failure_kind = 'retryable'`).
+   Corrupt/mismatched media, missing S3 object versions, HTTP `400/415/422`
+   embedder rejections (`permanent_media`), and object-size limit violations
+   (`INGESTION_MAX_IMAGE_BYTES`, HTTP `413`, `permanent_limit`) fail terminally
+   on the first attempt without wasting retries.
 
 ## Phase 2: bounded video extraction
 
